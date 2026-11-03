@@ -17,6 +17,7 @@
 #include <commctrl.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <map>
@@ -42,7 +43,7 @@ static const wchar_t* VIEW_NAMES[V_COUNT] = {L"가위바위보", L"주사위", L
 static const int TABS_1[] = {V_RPS, V_DICE, V_TTT, V_OMOK, V_YUT, V_FIGHT};
 static const int TABS_G[] = {V_WORD, V_RPS, V_DICE, V_GUD, V_TTT, V_OMOK, V_YUT, V_FIGHT};
 static bool isPairView(int v) { return v == V_TTT || v == V_OMOK || v == V_YUT || v == V_FIGHT; }
-enum { ID_GAME0 = 100, ID_SEND = 200, ID_HOST, ID_JOIN, ID_INPUT, ID_ONLINE, ID_CODEJOIN, ID_GROUP, ID_ENDMATCH };
+enum { ID_GAME0 = 100, ID_SEND = 200, ID_HOST, ID_JOIN, ID_INPUT, ID_ONLINE, ID_CODEJOIN, ID_GROUP, ID_ENDMATCH, ID_HOME, ID_FULL };
 enum { TIMER_FRAME = 1, TIMER_JOIN = 2, TIMER_PING = 3 };
 
 // 온라인(방 코드) 모드: 공개 MQTT 중계 서버를 통해 메시지를 주고받는다.
@@ -58,10 +59,10 @@ static const int* g_tabs = TABS_1;
 static int g_tabCount = 6;
 
 static HINSTANCE g_inst;
-static HWND g_hwnd, hLog, hInput, hSend, hGameBtn[V_COUNT], hStrip, hStripBtn;
+static HWND g_hwnd, hLog, hInput, hSend, hGameBtn[V_COUNT], hStrip, hStripBtn, hHomeBtn, hFullBtn;
 static HWND hLblName, hName, hLblIp, hIp, hPort, hHost, hJoin, hStatus, hOnline, hLblCode, hCode, hCodeJoin, hGroup;
 static double g_scale = 1.0;
-static HFONT g_uiFont, g_logFont;
+static HFONT g_uiFont, g_logFont, g_tabFont;
 static HBRUSH g_whiteBrush;
 
 static SOCKET g_sock = INVALID_SOCKET;
@@ -86,6 +87,27 @@ static const COLORREF COL_WIN = RGB(226, 230, 240), COL_BG = RGB(248, 249, 252),
                       COL_ACC = RGB(255, 160, 40), COL_WINC = RGB(30, 160, 80);
 
 static int S(double v) { return (int)std::lround(v * g_scale); }
+// 화면 배율: g_scale = g_baseScale(DPI) × g_zoom(전체 화면 확대). 전체 화면이면 가운데 정렬 여백 g_offX/Y
+static double g_baseScale = 1.0, g_zoom = 1.0;
+static int g_offX = 0, g_offY = 0;
+static bool g_full = false;
+static WINDOWPLACEMENT g_prevPlace{sizeof(WINDOWPLACEMENT)};
+static const DWORD WND_STYLE = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
+static int PX(double v) { return g_offX + S(v); }   // 논리 좌표 → 창 픽셀 좌표
+static int PY(double v) { return g_offY + S(v); }
+// 컨트롤의 논리 위치를 기억해 두었다가 배율이 바뀌면 다시 배치
+struct CtlInfo { int x, y, w, h, font; };   // font: 0 기본, 1 채팅 로그, 2 탭
+static std::map<HWND, CtlInfo> g_ctl;
+static void placeCtl(HWND h) {
+    auto it = g_ctl.find(h);
+    if (it == g_ctl.end()) return;
+    const CtlInfo& c = it->second;
+    MoveWindow(h, PX(c.x), PY(c.y), S(c.w), S(c.h), TRUE);
+    SendMessageW(h, WM_SETFONT, (WPARAM)(c.font == 1 ? g_logFont : c.font == 2 ? g_tabFont : g_uiFont), TRUE);
+}
+// 연결 세대 번호: 방에서 나가거나 대기를 취소하면 1 증가 → 예전 연결 스레드가 보낸 메시지는 무시
+static std::atomic<unsigned> g_gen{1};
+static SOCKET g_listen = INVALID_SOCKET;   // IP 방 만들기 대기 소켓
 
 // ───────────────────────── 문자열 ─────────────────────────
 static std::wstring W(const std::string& s) {
@@ -271,12 +293,12 @@ static void sendMsg(const std::string& type, const std::string& payload = "") {
 }
 
 static void invalidateCanvas() {
-    RECT r{S(CX), S(CY), S(CX + CW), S(CY + CH)};
+    RECT r{PX(CX), PY(CY), PX(CX + CW), PY(CY + CH)};
     InvalidateRect(g_hwnd, &r, FALSE);
 }
 static void setView(int v) {
     g_view = v;
-    RECT r{0, 0, S(CX + CW), S(CY)};
+    RECT r{0, 0, PX(CX + CW), PY(CY)};
     InvalidateRect(g_hwnd, &r, FALSE);
     invalidateCanvas();
 }
@@ -1654,7 +1676,6 @@ static int g_chalView = -1, g_chalInView = -1;
 static ULONGLONG g_chalAt = 0, g_chalInAt = 0;
 static std::map<std::string, std::string> g_pairs;   // 대결 중인 사람 → 상대 (다른 사람들 것 포함)
 static const Btn chalYes{150, 262, 160, 46}, chalNo{330, 262, 160, 46};
-static HFONT g_tabFont;
 static HBRUSH g_winBrush;
 
 static void updateStrip() {
@@ -1678,8 +1699,8 @@ static void layoutTabs() {
     for (int i = 0; i < V_COUNT; i++) {
         if (i < g_tabCount) {
             SetWindowTextW(hGameBtn[i], VIEW_NAMES[g_tabs[i]]);
-            SendMessageW(hGameBtn[i], WM_SETFONT, (WPARAM)(g_group ? g_tabFont : g_uiFont), TRUE);
-            MoveWindow(hGameBtn[i], S(CX + i * g_btnStep), S(8), S(g_btnW), S(34), TRUE);
+            g_ctl[hGameBtn[i]] = {CX + i * g_btnStep, 8, g_btnW, 34, g_group ? 2 : 0};
+            placeCtl(hGameBtn[i]);
             ShowWindow(hGameBtn[i], SW_SHOW);
         } else {
             ShowWindow(hGameBtn[i], SW_HIDE);
@@ -2414,7 +2435,7 @@ static void handleNet(const std::string& line) {
 }
 
 // ═════════════════════════ 연결 ═════════════════════════
-static void recvLoop(SOCKET s) {
+static void recvLoop(SOCKET s, unsigned gen) {
     std::string buf;
     char tmp[4096];
     for (;;) {
@@ -2425,10 +2446,10 @@ static void recvLoop(SOCKET s) {
         while ((pos = buf.find('\n')) != std::string::npos) {
             std::string* line = new std::string(buf.substr(0, pos));
             buf.erase(0, pos + 1);
-            if (line->empty() || !PostMessageW(g_hwnd, WM_NET, 0, (LPARAM)line)) delete line;
+            if (line->empty() || !PostMessageW(g_hwnd, WM_NET, gen, (LPARAM)line)) delete line;
         }
     }
-    PostMessageW(g_hwnd, WM_NETCLOSED, 0, 0);
+    PostMessageW(g_hwnd, WM_NETCLOSED, gen, 0);
 }
 
 static std::wstring localIPs() {
@@ -2448,7 +2469,7 @@ static std::wstring localIPs() {
     return r;
 }
 
-static void mqttRecvLoop(SOCKET s) {
+static void mqttRecvLoop(SOCKET s, unsigned gen) {
     unsigned char h;
     std::string b;
     while (mqttRead(s, h, b)) {
@@ -2457,9 +2478,9 @@ static void mqttRecvLoop(SOCKET s) {
         if ((h >> 1) & 3) off += 2;
         if (off >= b.size()) continue;
         std::string* line = new std::string(b.substr(off));
-        if (!PostMessageW(g_hwnd, WM_NET, 0, (LPARAM)line)) delete line;
+        if (!PostMessageW(g_hwnd, WM_NET, gen, (LPARAM)line)) delete line;
     }
-    PostMessageW(g_hwnd, WM_NETCLOSED, 0, 0);
+    PostMessageW(g_hwnd, WM_NETCLOSED, gen, 0);
 }
 
 static void setConnUiEnabled(bool en) {
@@ -2482,23 +2503,25 @@ static void startOnlineHost() {
     g_busy = true;
     setConnUiEnabled(false);
     SetWindowTextW(hStatus, L"중계 서버에 연결 중...");
-    std::thread([]() {
+    unsigned gen = g_gen;
+    std::thread([gen]() {
         std::random_device rd;
-        for (int bi = 0; bi < NBROKER; bi++) {
+        for (int bi = 0; bi < NBROKER && gen == g_gen; bi++) {
             std::string code(1, (char)('1' + bi));   // 1:1 방 코드는 숫자로 시작
             for (int i = 0; i < 5; i++) code += CODE_ABC[rd() % 32];
             std::string peer = TOPIC_BASE + code + "/c";
             SOCKET s = mqttOpen(bi, TOPIC_BASE + code + "/h", peer, "BYE|");
             if (s != INVALID_SOCKET) {
+                if (gen != g_gen) { closesocket(s); return; }   // 그 사이 취소됨
                 g_code = code;
                 g_peerTopic = peer;
                 g_sock = s;
-                std::thread(mqttRecvLoop, s).detach();
+                std::thread(mqttRecvLoop, s, gen).detach();
                 PostMessageW(g_hwnd, WM_RELAYREADY, 1, 1);
                 return;
             }
         }
-        PostMessageW(g_hwnd, WM_RELAYREADY, 0, 1);
+        if (gen == g_gen) PostMessageW(g_hwnd, WM_RELAYREADY, 0, 1);
     }).detach();
 }
 static void startOnlineJoin() {
@@ -2517,8 +2540,9 @@ static void startOnlineJoin() {
     g_isHost = false;
     g_busy = true;
     setConnUiEnabled(false);
-    SetWindowTextW(hStatus, (L"방 " + W(code) + L" 를 찾는 중...").c_str());
-    std::thread([code, grp]() {
+    SetWindowTextW(hStatus, (L"방 " + W(code) + L" 를 찾는 중...\n(취소: 오른쪽 위 '메인 화면으로')").c_str());
+    unsigned gen = g_gen;
+    std::thread([code, grp, gen]() {
         std::string sub, peer, will;
         if (grp) {
             sub = peer = TOPIC_BASE + code + "/g";
@@ -2529,11 +2553,15 @@ static void startOnlineJoin() {
             will = "BYE|";
         }
         SOCKET s = mqttOpen(grp ? code[0] - 'A' : code[0] - '1', sub, peer, will);
+        if (gen != g_gen) {   // 그 사이 취소됨
+            if (s != INVALID_SOCKET) closesocket(s);
+            return;
+        }
         if (s != INVALID_SOCKET) {
             g_code = code;
             g_peerTopic = peer;
             g_sock = s;
-            std::thread(mqttRecvLoop, s).detach();
+            std::thread(mqttRecvLoop, s, gen).detach();
         }
         PostMessageW(g_hwnd, WM_RELAYREADY, s != INVALID_SOCKET, grp ? 3 : 0);
     }).detach();
@@ -2545,23 +2573,25 @@ static void startGroupHost() {
     g_busy = true;
     setConnUiEnabled(false);
     SetWindowTextW(hStatus, L"중계 서버에 연결 중...");
-    std::thread([]() {
+    unsigned gen = g_gen;
+    std::thread([gen]() {
         std::random_device rd;
-        for (int bi = 0; bi < NBROKER; bi++) {
+        for (int bi = 0; bi < NBROKER && gen == g_gen; bi++) {
             std::string code(1, (char)('A' + bi));   // 단체 방 코드는 A~C로 시작
             for (int i = 0; i < 5; i++) code += CODE_ABC[rd() % 32];
             std::string topic = TOPIC_BASE + code + "/g";
             SOCKET s = mqttOpen(bi, topic, topic, g_pid + "|LEAVE|");
             if (s != INVALID_SOCKET) {
+                if (gen != g_gen) { closesocket(s); return; }
                 g_code = code;
                 g_peerTopic = topic;
                 g_sock = s;
-                std::thread(mqttRecvLoop, s).detach();
+                std::thread(mqttRecvLoop, s, gen).detach();
                 PostMessageW(g_hwnd, WM_RELAYREADY, 1, 2);
                 return;
             }
         }
-        PostMessageW(g_hwnd, WM_RELAYREADY, 0, 2);
+        if (gen == g_gen) PostMessageW(g_hwnd, WM_RELAYREADY, 0, 2);
     }).detach();
 }
 static void relayFail(const std::wstring& why) {
@@ -2600,7 +2630,7 @@ static void onRelayReady(bool ok, int kind) {
         std::wstring code = W(g_code);
         SetWindowTextW(hCode, code.c_str());
         copyToClipboard(code);
-        SetWindowTextW(hStatus, (L"방 코드:  " + code + L"\n(클립보드에 복사됨 — 친구에게 보내주세요)\n친구가 들어오길 기다리는 중...").c_str());
+        SetWindowTextW(hStatus, (L"방 코드:  " + code + L"\n(클립보드에 복사됨 — 친구에게 보내주세요)\n친구가 들어오길 기다리는 중...\n(취소: 오른쪽 위 '메인 화면으로')").c_str());
         SetWindowTextW(g_hwnd, (L"미니게임 채팅 - 방 " + code).c_str());
     } else {
         g_joinTries = 0;
@@ -2625,9 +2655,16 @@ static void startHost(int port) {
     g_busy = true;
     setConnUiEnabled(false);
     SetWindowTextW(hStatus, (L"방을 만들었습니다! (포트 " + I(port) + L")\n상대에게 알려줄 IP: " + localIPs() +
-                             L"\n같은 PC 테스트는 127.0.0.1\n상대 접속을 기다리는 중...").c_str());
-    std::thread([ls]() {
+                             L"\n같은 PC 테스트는 127.0.0.1\n상대 접속을 기다리는 중... (취소: '메인 화면으로')").c_str());
+    g_listen = ls;
+    unsigned gen = g_gen;
+    std::thread([ls, gen]() {
         SOCKET s = accept(ls, nullptr, nullptr);
+        if (gen != g_gen) {   // 취소됨 (대기 소켓은 취소할 때 이미 닫힘)
+            if (s != INVALID_SOCKET) closesocket(s);
+            return;
+        }
+        g_listen = INVALID_SOCKET;
         closesocket(ls);
         if (s != INVALID_SOCKET) g_sock = s;
         PostMessageW(g_hwnd, WM_CONNRESULT, s != INVALID_SOCKET, 0);
@@ -2639,7 +2676,8 @@ static void startJoin(const std::wstring& ipW, int port) {
     setConnUiEnabled(false);
     SetWindowTextW(hStatus, (ipW + L":" + I(port) + L" 에 접속 중...").c_str());
     std::string ip = U8(ipW);
-    std::thread([ip, port]() {
+    unsigned gen = g_gen;
+    std::thread([ip, port, gen]() {
         addrinfo hints{}, *res = nullptr;
         hints.ai_family = AF_INET;
         hints.ai_socktype = SOCK_STREAM;
@@ -2651,6 +2689,10 @@ static void startJoin(const std::wstring& ipW, int port) {
             freeaddrinfo(res);
             if (!ok) closesocket(s);
         }
+        if (gen != g_gen) {   // 취소됨
+            if (ok) closesocket(s);
+            return;
+        }
         if (ok) g_sock = s;
         PostMessageW(g_hwnd, WM_CONNRESULT, ok, 1);
     }).detach();
@@ -2659,7 +2701,7 @@ static void onDisconnected(const std::wstring& why) {
     if (g_ended) return;
     g_ended = true;
     sys(why);
-    sys(L"연결이 끊어졌습니다. 프로그램을 다시 실행해서 접속하세요.");
+    sys(L"연결이 끊어졌습니다. 오른쪽 위 '메인 화면으로'를 눌러 다시 접속할 수 있어요.");
     EnableWindow(hInput, FALSE);
     EnableWindow(hSend, FALSE);
     F.on = false;
@@ -2699,7 +2741,7 @@ static void onConnected() {
         BOOL nd = TRUE;
         setsockopt(g_sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&nd, sizeof(nd));
         SOCKET s = g_sock;
-        std::thread(recvLoop, s).detach();
+        std::thread(recvLoop, s, (unsigned)g_gen).detach();
     }
     sys(g_relay ? L"방 " + W(g_code) + L" 연결 성공! (중계 서버 경유)" : std::wstring(L"연결 성공!"));
     printHelp();
@@ -2708,6 +2750,107 @@ static void onConnected() {
     GetClientRect(g_hwnd, &r);
     InvalidateRect(g_hwnd, &r, FALSE);
     SetFocus(hInput);
+}
+
+// 모든 연결과 게임 상태를 지우고 첫 접속 화면으로 돌아감
+static void goHome(const std::wstring& status) {
+    g_gen++;
+    KillTimer(g_hwnd, TIMER_JOIN);
+    KillTimer(g_hwnd, TIMER_PING);
+    if (g_listen != INVALID_SOCKET) {
+        closesocket(g_listen);
+        g_listen = INVALID_SOCKET;
+    }
+    SOCKET s = g_sock;
+    g_sock = INVALID_SOCKET;
+    if (s != INVALID_SOCKET) {
+        shutdown(s, SD_BOTH);
+        closesocket(s);
+    }
+    g_connected = g_busy = g_isHost = g_ended = g_relay = g_group = false;
+    g_code.clear();
+    g_peerTopic.clear();
+    g_matchPid.clear();
+    g_hostPid.clear();
+    g_peer = L"상대";
+    R = decltype(R)();
+    D = decltype(D)();
+    T = decltype(T)();
+    O = decltype(O)();
+    Y = decltype(Y)();
+    F = FightState();
+    B = decltype(B)();
+    UD = decltype(UD)();
+    K = decltype(K)();
+    GP.clear();
+    GR = decltype(GR)();
+    GD = decltype(GD)();
+    GU = decltype(GU)();
+    g_pairs.clear();
+    g_chalTo.clear();
+    g_chalFrom.clear();
+    g_view = V_RPS;
+    for (HWND h : hGameBtn) ShowWindow(h, SW_HIDE);
+    for (HWND h : {hLblName, hName, hLblIp, hIp, hPort, hHost, hJoin, hStatus, hOnline, hLblCode, hCode, hCodeJoin, hGroup})
+        ShowWindow(h, SW_SHOW);
+    setConnUiEnabled(true);
+    SetWindowTextW(hCode, L"");
+    EnableWindow(hInput, FALSE);
+    EnableWindow(hSend, FALSE);
+    SetWindowTextW(hStatus, status.c_str());
+    SetWindowTextW(g_hwnd, L"미니게임 채팅");
+    updateStrip();
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+static void leaveRoom() {
+    if (g_sock != INVALID_SOCKET && g_connected && !g_ended) {
+        sendMsg(g_group ? (g_isHost ? "CLOSE" : "LEAVE") : "BYE");   // 상대에게 나간다고 알림
+        if (g_relay) rawSend(std::string("\xE0\x00", 2));             // MQTT DISCONNECT
+    }
+    logLine(L"────────────────");
+    sys(L"방에서 나와 메인 화면으로 돌아왔습니다.");
+    goHome(L"방에서 나왔습니다.\n새 방을 만들거나 코드로 참가하세요.");
+}
+// 배율이 바뀌면 글꼴을 새 크기로 만들고 모든 컨트롤을 다시 배치
+static void applyLayout() {
+    HFONT o1 = g_uiFont, o2 = g_logFont, o3 = g_tabFont;
+    auto mkf = [](int px) {
+        return CreateFontW(-S(px), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Malgun Gothic");
+    };
+    g_uiFont = mkf(15);
+    g_logFont = mkf(14);
+    g_tabFont = mkf(13);
+    for (auto& kv : g_ctl) placeCtl(kv.first);
+    DeleteObject(o1);
+    DeleteObject(o2);
+    DeleteObject(o3);
+    InvalidateRect(g_hwnd, nullptr, TRUE);
+}
+static void setFullscreen(bool on) {
+    if (on == g_full) return;
+    g_full = on;
+    if (on) {
+        GetWindowPlacement(g_hwnd, &g_prevPlace);
+        MONITORINFO mi{sizeof(mi)};
+        GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+        RECT m = mi.rcMonitor;
+        int mw = m.right - m.left, mh = m.bottom - m.top;
+        g_zoom = std::min(mw / (1000.0 * g_baseScale), mh / (570.0 * g_baseScale));
+        g_scale = g_baseScale * g_zoom;
+        g_offX = (mw - S(1000)) / 2;
+        g_offY = (mh - S(570)) / 2;
+        SetWindowLongPtrW(g_hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN);
+        SetWindowPos(g_hwnd, HWND_TOP, m.left, m.top, mw, mh, SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+    } else {
+        g_zoom = 1.0;
+        g_scale = g_baseScale;
+        g_offX = g_offY = 0;
+        SetWindowLongPtrW(g_hwnd, GWL_STYLE, WND_STYLE | WS_VISIBLE);
+        SetWindowPlacement(g_hwnd, &g_prevPlace);
+        SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    }
+    SetWindowTextW(hFullBtn, on ? L"창 모드로 (F11)" : L"전체 화면 (F11)");
+    applyLayout();
 }
 
 static void sendChat() {
@@ -2811,8 +2954,9 @@ static void canvasClick(int x, int y) {
 
 static HWND mk(const wchar_t* cls, const wchar_t* txt, DWORD style, int x, int y, int w, int h, int id = 0,
                DWORD ex = 0) {
-    HWND hw = CreateWindowExW(ex, cls, txt, WS_CHILD | WS_VISIBLE | style, S(x), S(y), S(w), S(h), g_hwnd,
+    HWND hw = CreateWindowExW(ex, cls, txt, WS_CHILD | WS_VISIBLE | style, PX(x), PY(y), S(w), S(h), g_hwnd,
                               (HMENU)(INT_PTR)id, g_inst, nullptr);
+    g_ctl[hw] = {x, y, w, h, 0};
     SendMessageW(hw, WM_SETFONT, (WPARAM)g_uiFont, TRUE);
     return hw;
 }
@@ -2834,7 +2978,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             hStrip = mk(L"STATIC", L"", SS_LEFT | SS_CENTERIMAGE | SS_ENDELLIPSIS, 14, 536, 520, 28);
             hStripBtn = mk(L"BUTTON", L"대결 끝내기", BS_PUSHBUTTON, 540, 535, 110, 30, ID_ENDMATCH);
             ShowWindow(hStripBtn, SW_HIDE);
-            hLog = mk(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 660, 10, 330, 512, 0, WS_EX_CLIENTEDGE);
+            // 채팅 칸 위: 메인 화면으로 / 전체 화면 버튼
+            hHomeBtn = mk(L"BUTTON", L"◀ 메인 화면으로", BS_PUSHBUTTON, 660, 8, 162, 32, ID_HOME);
+            hFullBtn = mk(L"BUTTON", L"전체 화면 (F11)", BS_PUSHBUTTON, 828, 8, 162, 32, ID_FULL);
+            ShowWindow(hHomeBtn, SW_HIDE);
+            hLog = mk(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 660, 46, 330, 476, 0, WS_EX_CLIENTEDGE);
+            g_ctl[hLog].font = 1;
             SendMessageW(hLog, WM_SETFONT, (WPARAM)g_logFont, TRUE);
             SendMessageW(hLog, EM_SETLIMITTEXT, 0, 0);
             hInput = mk(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 660, 530, 262, 34, ID_INPUT, WS_EX_CLIENTEDGE);
@@ -2887,6 +3036,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     endMatchLocal(L"대결을 끝냈습니다. 다른 상대를 골라 신청할 수 있어요.");
                 }
                 SetFocus(hwnd);
+            } else if (id == ID_FULL) {
+                setFullscreen(!g_full);
+                SetFocus(hwnd);
+            } else if (id == ID_HOME) {
+                if (g_connected && !g_ended) {
+                    if (MessageBoxW(hwnd, L"방에서 나가고 메인 화면으로 돌아갈까요?", L"메인 화면으로", MB_YESNO | MB_ICONQUESTION) == IDYES)
+                        leaveRoom();
+                } else if (g_connected) {   // 이미 연결이 끊긴 방
+                    goHome(L"메인 화면으로 돌아왔습니다.\n새 방을 만들거나 코드로 참가하세요.");
+                } else if (g_busy) {        // 방 코드를 받고 기다리는 중 / 접속 중
+                    if (g_relay && g_sock != INVALID_SOCKET) rawSend(std::string("\xE0\x00", 2));
+                    goHome(L"취소했습니다.\n다시 방을 만들거나 코드로 참가하세요.");
+                }
+                SetFocus(hwnd);
             } else if (id == ID_SEND) {
                 sendChat();
                 SetFocus(hInput);
@@ -2918,7 +3081,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_NET: {
             std::string* line = (std::string*)lp;
-            handleNet(*line);
+            if (wp == g_gen) handleNet(*line);   // 예전 연결의 메시지는 무시
             delete line;
             return 0;
         }
@@ -2926,6 +3089,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             onRelayReady(wp != 0, (int)lp);
             return 0;
         case WM_NETCLOSED:
+            if (wp != g_gen) return 0;
             if (g_connected) onDisconnected(g_relay ? L"중계 서버와의 연결이 끊겼습니다." : g_peer + L" 님과의 연결이 끊겼습니다.");
             else if (g_relay && g_busy) relayFail(L"중계 서버와의 연결이 끊겼어요. 다시 시도하세요.");
             return 0;
@@ -2933,6 +3097,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp == TIMER_FRAME) {
                 static int frame = 0;
                 frame++;
+                bool wantHome = g_connected || g_busy;   // 메인 화면 버튼은 방/대기 중일 때만
+                if (wantHome != (IsWindowVisible(hHomeBtn) != FALSE)) ShowWindow(hHomeBtn, wantHome ? SW_SHOW : SW_HIDE);
                 if (F.on) {
                     fightTick();
                     if (g_view == V_FIGHT) invalidateCanvas();
@@ -2953,12 +3119,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONDOWN: {
             SetFocus(hwnd);
             int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
-            double lx = (x - S(CX)) / g_scale, ly = (y - S(CY)) / g_scale;
+            double lx = (x - PX(CX)) / g_scale, ly = (y - PY(CY)) / g_scale;
             if (lx >= 0 && ly >= 0 && lx < CW && ly < CH) canvasClick((int)lx, (int)ly);
             return 0;
         }
         case WM_KEYDOWN:
             if (wp == VK_RETURN && g_connected) SetFocus(hInput);
+            if (wp == VK_ESCAPE && g_full) setFullscreen(false);
             return 0;
         case WM_ERASEBKGND:
             return 1;
@@ -2967,14 +3134,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             HDC hdc = BeginPaint(hwnd, &ps);
             RECT cr;
             GetClientRect(hwnd, &cr);
-            int cx = S(CX), cy = S(CY), cw = S(CW), ch = S(CH);
+            int cx = PX(CX), cy = PY(CY), cw = S(CW), ch = S(CH);
             ExcludeClipRect(hdc, cx, cy, cx + cw, cy + ch);
             HBRUSH bg = CreateSolidBrush(COL_WIN);
             FillRect(hdc, &cr, bg);
             DeleteObject(bg);
             for (int i = 0; g_connected && i < g_tabCount; i++) {   // 선택된 탭 아래 주황 막대
                 if (g_tabs[i] != g_view) continue;
-                RECT ind{S(CX + i * g_btnStep), S(43), S(CX + i * g_btnStep + g_btnW), S(47)};
+                RECT ind{PX(CX + i * g_btnStep), PY(43), PX(CX + i * g_btnStep + g_btnW), PY(47)};
                 HBRUSH ab = CreateSolidBrush(COL_ACC);
                 FillRect(hdc, &ind, ab);
                 DeleteObject(ab);
@@ -3022,7 +3189,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nShow) {
     }
     SetProcessDPIAware();
     HDC sdc = GetDC(nullptr);
-    g_scale = GetDeviceCaps(sdc, LOGPIXELSX) / 96.0;
+    g_scale = g_baseScale = GetDeviceCaps(sdc, LOGPIXELSX) / 96.0;
     ReleaseDC(nullptr, sdc);
 
     WSADATA wsa;
@@ -3038,7 +3205,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nShow) {
     wc.lpszClassName = L"MiniGameChat";
     RegisterClassExW(&wc);
 
-    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
+    DWORD style = WND_STYLE;
     RECT r{0, 0, S(1000), S(570)};
     AdjustWindowRect(&r, style, FALSE);
     HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"미니게임 채팅", style, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -3048,6 +3215,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nShow) {
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0)) {
+        if (m.message == WM_KEYDOWN && m.wParam == VK_F11) {   // 어느 칸에 있든 F11 = 전체 화면 켜기/끄기
+            setFullscreen(!g_full);
+            continue;
+        }
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }
