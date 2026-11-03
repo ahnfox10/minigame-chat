@@ -1,0 +1,9 @@
+# 빌드 중간 파일
+*.obj
+*.res
+*.pdb
+*.ilk
+*.exe.manifest
+
+# 제출용 압축 파일
+*.zip

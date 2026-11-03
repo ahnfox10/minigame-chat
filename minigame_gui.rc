@@ -1,0 +1,2 @@
+// 끝말잇기 단어 사전 (표준국어대사전 명사, CC0) 을 exe 안에 넣는다
+1 RCDATA "data\\korean_nouns.txt"
