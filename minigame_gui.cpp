@@ -46,8 +46,8 @@ static const wchar_t* VIEW_NAMES[V_COUNT] = {L"가위바위보", L"주사위", L
 static const int TABS_1[] = {V_RPS, V_DICE, V_TTT, V_OMOK, V_YUT, V_FIGHT};
 static const int TABS_G[] = {V_WORD, V_RPS, V_DICE, V_GUD, V_TTT, V_OMOK, V_YUT, V_FIGHT};
 static bool isPairView(int v) { return v == V_TTT || v == V_OMOK || v == V_YUT || v == V_FIGHT; }
-enum { ID_GAME0 = 100, ID_SEND = 200, ID_HOST, ID_JOIN, ID_INPUT, ID_ONLINE, ID_CODEJOIN, ID_GROUP, ID_ENDMATCH, ID_HOME, ID_FULL };
-enum { TIMER_FRAME = 1, TIMER_JOIN = 2, TIMER_PING = 3 };
+enum { ID_GAME0 = 100, ID_SEND = 200, ID_HOST, ID_JOIN, ID_INPUT, ID_ONLINE, ID_CODEJOIN, ID_GROUP, ID_ENDMATCH, ID_HOME, ID_FULL, ID_COPY };
+enum { TIMER_FRAME = 1, TIMER_JOIN = 2, TIMER_PING = 3, TIMER_COPY = 4 };
 
 // 온라인(방 코드) 모드: 공개 MQTT 중계 서버를 통해 메시지를 주고받는다.
 struct Broker { const char* host; int port; };
@@ -62,7 +62,7 @@ static const int* g_tabs = TABS_1;
 static int g_tabCount = 6;
 
 static HINSTANCE g_inst;
-static HWND g_hwnd, hLog, hInput, hSend, hGameBtn[V_COUNT], hStrip, hStripBtn, hHomeBtn, hFullBtn;
+static HWND g_hwnd, hLog, hInput, hSend, hGameBtn[V_COUNT], hStrip, hStripBtn, hHomeBtn, hFullBtn, hCopyBtn;
 static HWND hLblName, hName, hLblIp, hIp, hPort, hHost, hJoin, hStatus, hOnline, hLblCode, hCode, hCodeJoin, hGroup;
 static double g_scale = 1.0;
 static HFONT g_uiFont, g_logFont, g_tabFont;
@@ -423,9 +423,11 @@ static void button(HDC dc, const Btn& b, const std::wstring& s, bool enabled = t
     COLORREF f = enabled ? col : RGB(212, 221, 233);
     roundRect(dc, b.x, b.y + 4, b.w, b.h, darker(f, 0.82), darker(f, 0.82), b.h, 1);   // 아래 그림자 (말랑한 버튼)
     roundRect(dc, b.x, b.y, b.w, b.h, f, f, b.h, 1);
-    COLORREF hi = RGB(std::min(255, GetRValue(f) + 36), std::min(255, GetGValue(f) + 36), std::min(255, GetBValue(f) + 36));
-    roundRect(dc, b.x + b.h / 4, b.y + 4, b.w - b.h / 2, b.h / 3, hi, hi, b.h / 3, 1);   // 위쪽 반짝이
-    text(dc, b.x, b.y, b.w, b.h, s, size, RGB(255, 255, 255), true);
+    if (enabled) {
+        COLORREF hi = RGB(std::min(255, GetRValue(f) + 36), std::min(255, GetGValue(f) + 36), std::min(255, GetBValue(f) + 36));
+        roundRect(dc, b.x + b.h / 4, b.y + 4, b.w - b.h / 2, b.h / 3, hi, hi, b.h / 3, 1);   // 위쪽 반짝이
+    }
+    text(dc, b.x, b.y, b.w, b.h, s, size, enabled ? RGB(255, 255, 255) : RGB(140, 152, 172), true);   // 비활성은 회색 글자
 }
 static void title(HDC dc, const std::wstring& t, const std::wstring& sub) {
     circle(dc, 26, 26, 6, COL_MAIN, COL_MAIN, 1);
@@ -1734,7 +1736,10 @@ static std::map<std::string, std::string> g_pairs;   // 대결 중인 사람 →
 static const Btn chalYes{150, 262, 160, 46}, chalNo{330, 262, 160, 46};
 static HBRUSH g_winBrush;
 
+static void updateCopyBtn();
+static std::wstring bestIP();
 static void updateStrip() {
+    updateCopyBtn();
     std::wstring s;
     if (g_ended) s = L"연결이 끊어졌습니다.";
     else if (!g_connected) s = L"";
@@ -2661,6 +2666,7 @@ static void relayFail(const std::wstring& why) {
     g_group = false;
     setConnUiEnabled(true);
     SetWindowTextW(hStatus, why.c_str());
+    updateCopyBtn();
 }
 // kind: 0 = 1:1 참가, 1 = 1:1 방장, 2 = 단체 방장, 3 = 단체 참가
 static void onRelayReady(bool ok, int kind) {
@@ -2686,8 +2692,9 @@ static void onRelayReady(bool ok, int kind) {
         std::wstring code = W(g_code);
         SetWindowTextW(hCode, code.c_str());
         copyToClipboard(code);
-        SetWindowTextW(hStatus, (L"방 코드:  " + code + L"\n(클립보드에 복사됨 — 친구에게 보내주세요)\n친구가 들어오길 기다리는 중...\n(취소: 오른쪽 위 '메인 화면으로')").c_str());
+        SetWindowTextW(hStatus, (L"방 코드:  " + code + L"\n(클립보드에 복사됨 — '코드 복사'로 다시 복사)\n친구가 들어오길 기다리는 중...\n(취소: 오른쪽 위 '메인 화면으로')").c_str());
         SetWindowTextW(g_hwnd, (L"미니게임 채팅 - 방 " + code).c_str());
+        updateCopyBtn();
     } else {
         g_joinTries = 0;
         sendMsg("JOIN", U8(g_myName));
@@ -2710,9 +2717,12 @@ static void startHost(int port) {
     g_isHost = true;
     g_busy = true;
     setConnUiEnabled(false);
-    SetWindowTextW(hStatus, (L"방을 만들었습니다! (포트 " + I(port) + L")\n상대에게 알려줄 IP: " + localIPs() +
-                             L"\n같은 PC 테스트는 127.0.0.1\n상대 접속을 기다리는 중... (취소: '메인 화면으로')").c_str());
+    std::wstring myIp = bestIP();
+    copyToClipboard(myIp);
+    SetWindowTextW(hStatus, (L"방을 만들었습니다! 내 IP: " + myIp + (port != 5555 ? L"  (포트 " + I(port) + L")" : L"") +
+                             L"\n(클립보드에 복사됨 — '내 IP 복사'로 다시 복사)\n상대 접속을 기다리는 중... (취소: '메인 화면으로')").c_str());
     g_listen = ls;
+    updateCopyBtn();
     unsigned gen = g_gen;
     std::thread([ls, gen]() {
         SOCKET s = accept(ls, nullptr, nullptr);
@@ -2772,6 +2782,62 @@ static void onDisconnected(const std::wstring& why) {
     GetClientRect(g_hwnd, &r);
     InvalidateRect(g_hwnd, &r, FALSE);
 }
+// 같은 와이파이 친구에게 알려줄 내 IP 하나 (사설 IP 우선)
+static std::wstring bestIP() {
+    std::wstring all = localIPs(), first, best;
+    size_t p = 0;
+    while (p <= all.size()) {
+        size_t q = all.find(L", ", p);
+        std::wstring ip = all.substr(p, q == std::wstring::npos ? std::wstring::npos : q - p);
+        if (!ip.empty()) {
+            if (first.empty()) first = ip;
+            bool priv = ip.rfind(L"192.168.", 0) == 0 || ip.rfind(L"10.", 0) == 0 || ip.rfind(L"172.", 0) == 0;
+            if (priv && best.empty()) best = ip;
+        }
+        if (q == std::wstring::npos) break;
+        p = q + 2;
+    }
+    return best.empty() ? (first.empty() ? L"127.0.0.1" : first) : best;
+}
+
+// 복사 버튼: 상황에 따라 위치·글자·복사할 내용이 바뀜
+//  1 = 1:1 방 코드 대기 중 (코드로 참가 자리), 2 = IP 방 대기 중 (IP로 참가 자리), 3 = 단체 방 안 (상태줄 오른쪽)
+static int g_copyMode = 0;
+static std::wstring copyLabel() { return g_copyMode == 2 ? L"내 IP 복사" : L"코드 복사"; }
+static std::wstring copyValue() { return g_copyMode == 2 ? bestIP() : W(g_code); }
+static void updateCopyBtn() {
+    if (!hCopyBtn) return;
+    int mode = 0;
+    if (!g_connected && g_busy && g_isHost && g_relay && !g_group && !g_code.empty()) mode = 1;
+    else if (!g_connected && g_busy && g_isHost && !g_relay && g_listen != INVALID_SOCKET) mode = 2;
+    else if (g_connected && g_group && !g_ended && g_matchPid.empty() && !g_code.empty()) mode = 3;
+    if (!g_connected) {   // 바꿔 끼운 자리의 원래 버튼은 숨김
+        ShowWindow(hCodeJoin, mode == 1 ? SW_HIDE : SW_SHOW);
+        ShowWindow(hJoin, mode == 2 ? SW_HIDE : SW_SHOW);
+    }
+    if (mode == g_copyMode) return;
+    g_copyMode = mode;
+    KillTimer(g_hwnd, TIMER_COPY);
+    if (!mode) { ShowWindow(hCopyBtn, SW_HIDE); return; }
+    if (mode == 1) g_ctl[hCopyBtn] = g_ctl[hCodeJoin];
+    else if (mode == 2) g_ctl[hCopyBtn] = g_ctl[hJoin];
+    else g_ctl[hCopyBtn] = {540, 535, 110, 30, 0};
+    placeCtl(hCopyBtn);
+    SetWindowTextW(hCopyBtn, copyLabel().c_str());
+    EnableWindow(hCopyBtn, TRUE);
+    ShowWindow(hCopyBtn, SW_SHOW);
+    InvalidateRect(hCopyBtn, nullptr, TRUE);
+}
+static void doCopy() {
+    if (!g_copyMode) return;
+    std::wstring v = copyValue();
+    copyToClipboard(v);
+    sys((g_copyMode == 2 ? L"내 IP " : L"방 코드 ") + v + L" 를 클립보드에 복사했습니다. 친구에게 붙여넣기(Ctrl+V) 해서 보내세요!");
+    SetWindowTextW(hCopyBtn, L"복사 완료!");
+    InvalidateRect(hCopyBtn, nullptr, TRUE);
+    SetTimer(g_hwnd, TIMER_COPY, 1500, nullptr);
+}
+
 static void onConnected() {
     g_connected = true;
     g_busy = false;
@@ -3033,7 +3099,8 @@ static void drawOwnerBtn(const DRAWITEMSTRUCT* di) {
     RECT r = di->rcItem;
     int ht = r.bottom - r.top;
     bool down = (di->itemState & ODS_SELECTED) != 0, off = (di->itemState & ODS_DISABLED) != 0;
-    bool onCard = h == hOnline || h == hGroup || h == hCodeJoin || h == hHost || h == hJoin;   // 메인 화면 흰 카드 위
+    bool onCard = h == hOnline || h == hGroup || h == hCodeJoin || h == hHost || h == hJoin ||
+                  (h == hCopyBtn && !g_connected);   // 메인 화면 흰 카드 위
 
     // 버튼 종류별 색: 채움색, 글자색, 테두리색
     COLORREF fill = COL_MAIN, fg = RGB(255, 255, 255), border = 0;
@@ -3109,6 +3176,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             hStrip = mk(L"STATIC", L"", SS_LEFT | SS_CENTERIMAGE | SS_ENDELLIPSIS, 14, 536, 520, 28);
             hStripBtn = mk(L"BUTTON", L"대결 끝내기", BS_OWNERDRAW, 540, 535, 110, 30, ID_ENDMATCH);
             ShowWindow(hStripBtn, SW_HIDE);
+            hCopyBtn = mk(L"BUTTON", L"코드 복사", BS_OWNERDRAW, 540, 535, 110, 30, ID_COPY);   // 위치는 updateCopyBtn이 정함
+            ShowWindow(hCopyBtn, SW_HIDE);
             // 채팅 칸 위: 메인 화면으로 / 전체 화면 버튼
             hHomeBtn = mk(L"BUTTON", L"◀ 메인 화면으로", BS_OWNERDRAW, 660, 8, 162, 32, ID_HOME);
             hFullBtn = mk(L"BUTTON", L"전체 화면 (F11)", BS_OWNERDRAW, 828, 8, 162, 32, ID_FULL);
@@ -3173,6 +3242,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     sendMsg("MEND", g_matchPid);
                     endMatchLocal(L"대결을 끝냈습니다. 다른 상대를 골라 신청할 수 있어요.");
                 }
+                SetFocus(hwnd);
+            } else if (id == ID_COPY) {
+                doCopy();
                 SetFocus(hwnd);
             } else if (id == ID_FULL) {
                 setFullscreen(!g_full);
@@ -3245,6 +3317,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     groupTick();
                     if (K.on && frame % 6 == 0) invalidateCanvas();   // 남은 시간 막대 갱신
                 }
+            } else if (wp == TIMER_COPY) {   // "복사 완료!" → 원래 글자로
+                KillTimer(hwnd, TIMER_COPY);
+                SetWindowTextW(hCopyBtn, copyLabel().c_str());
+                InvalidateRect(hCopyBtn, nullptr, TRUE);
             } else if (wp == TIMER_PING && g_relay && g_sock != INVALID_SOCKET) {
                 rawSend(std::string("\xC0\x00", 2));   // MQTT PINGREQ (연결 유지)
             } else if (wp == TIMER_JOIN) {
