@@ -15,6 +15,9 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
+#define CY CY_OLE_   // richedit.h가 끌어오는 OLE 형식 CY와 아래 화면 좌표 상수 CY가 겹치지 않게
+#include <richedit.h>
+#undef CY
 
 #include <algorithm>
 #include <atomic>
@@ -82,9 +85,11 @@ static std::wstring g_myName, g_peer = L"상대";
 static int g_view = V_RPS;
 static std::mt19937 g_rng{std::random_device{}()};
 
-static const COLORREF COL_WIN = RGB(226, 230, 240), COL_BG = RGB(248, 249, 252), COL_TEXT = RGB(40, 44, 60),
-                      COL_SUB = RGB(120, 125, 140), COL_ME = RGB(55, 105, 230), COL_OP = RGB(225, 65, 80),
-                      COL_ACC = RGB(255, 160, 40), COL_WINC = RGB(30, 160, 80);
+// 밝고 귀여운 파스텔 테마 (하늘·민트)
+static const COLORREF COL_WIN = RGB(224, 239, 252), COL_BG = RGB(250, 252, 255), COL_TEXT = RGB(50, 62, 96),
+                      COL_SUB = RGB(126, 140, 168), COL_ME = RGB(96, 134, 240), COL_OP = RGB(244, 112, 98),
+                      COL_ACC = RGB(255, 172, 64), COL_WINC = RGB(52, 184, 128), COL_MAIN = RGB(64, 192, 168),
+                      COL_LINE = RGB(198, 222, 242), COL_GRAY = RGB(166, 178, 198);
 
 static int S(double v) { return (int)std::lround(v * g_scale); }
 // 화면 배율: g_scale = g_baseScale(DPI) × g_zoom(전체 화면 확대). 전체 화면이면 가운데 정렬 여백 g_offX/Y
@@ -103,7 +108,20 @@ static void placeCtl(HWND h) {
     if (it == g_ctl.end()) return;
     const CtlInfo& c = it->second;
     MoveWindow(h, PX(c.x), PY(c.y), S(c.w), S(c.h), TRUE);
-    SendMessageW(h, WM_SETFONT, (WPARAM)(c.font == 1 ? g_logFont : c.font == 2 ? g_tabFont : g_uiFont), TRUE);
+    if (c.font == 1) {   // 채팅 로그(RichEdit): 글꼴·크기만 바꿔서 색·굵기는 유지
+        CHARFORMAT2W cf{};
+        cf.cbSize = sizeof(cf);
+        cf.dwMask = CFM_FACE | CFM_SIZE;
+        wcscpy_s(cf.szFaceName, L"Malgun Gothic");
+        HDC sdc = GetDC(nullptr);
+        cf.yHeight = MulDiv(S(15), 1440, GetDeviceCaps(sdc, LOGPIXELSY));
+        ReleaseDC(nullptr, sdc);
+        SendMessageW(h, EM_SETCHARFORMAT, SCF_ALL, (LPARAM)&cf);
+        SendMessageW(h, EM_SETCHARFORMAT, SCF_DEFAULT, (LPARAM)&cf);
+        SendMessageW(h, WM_VSCROLL, SB_BOTTOM, 0);   // 크기가 바뀌어도 최신 메시지가 보이게
+        return;
+    }
+    SendMessageW(h, WM_SETFONT, (WPARAM)(c.font == 2 ? g_tabFont : g_uiFont), TRUE);
 }
 // 연결 세대 번호: 방에서 나가거나 대기를 취소하면 1 증가 → 예전 연결 스레드가 보낸 메시지는 무시
 static std::atomic<unsigned> g_gen{1};
@@ -150,12 +168,39 @@ static std::wstring getText(HWND h) {
 static std::wstring I(int v) { return std::to_wstring(v); }
 
 // ───────────────────────── 로그 / 네트워크 ─────────────────────────
+// 채팅 칸은 RichEdit: 채팅(이름 굵게·색)과 시스템/게임 알림(연한 회색)을 구분해서 보여 줌
+static void logAppend(const std::wstring& s, COLORREF c, bool bold) {
+    SendMessageW(hLog, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+    CHARFORMAT2W cf{};
+    cf.cbSize = sizeof(cf);
+    cf.dwMask = CFM_COLOR | CFM_BOLD;
+    cf.crTextColor = c;
+    cf.dwEffects = bold ? CFE_BOLD : 0;
+    SendMessageW(hLog, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+    SendMessageW(hLog, EM_REPLACESEL, FALSE, (LPARAM)s.c_str());
+}
+static void logBreak(int spaceTwips) {   // 새 줄 시작 (+ 줄 위 여백)
+    if (GetWindowTextLengthW(hLog) > 0) logAppend(L"\r", RGB(0, 0, 0), false);
+    PARAFORMAT2 pf{};
+    pf.cbSize = sizeof(pf);
+    pf.dwMask = PFM_SPACEBEFORE;
+    pf.dySpaceBefore = spaceTwips;
+    SendMessageW(hLog, EM_SETSEL, (WPARAM)-1, (LPARAM)-1);
+    SendMessageW(hLog, EM_SETPARAFORMAT, 0, (LPARAM)&pf);
+}
+static void logEnd() { SendMessageW(hLog, WM_VSCROLL, SB_BOTTOM, 0); }
+// 시스템·게임 알림: 연한 회색
 static void logLine(const std::wstring& s) {
-    int len = GetWindowTextLengthW(hLog);
-    SendMessageW(hLog, EM_SETSEL, len, len);
-    std::wstring t = (len ? L"\r\n" : L"") + s;
-    SendMessageW(hLog, EM_REPLACESEL, FALSE, (LPARAM)t.c_str());
-    SendMessageW(hLog, EM_SCROLLCARET, 0, 0);
+    logBreak(40);
+    logAppend(s, RGB(140, 150, 170), false);
+    logEnd();
+}
+// 채팅: "이름  내용" — 이름은 굵게(나는 파랑, 상대는 산호색), 내용은 진한 글자
+static void chatLine(const std::wstring& name, const std::wstring& msg, bool mine) {
+    logBreak(120);
+    logAppend(name + L"  ", mine ? RGB(70, 110, 225) : RGB(225, 95, 80), true);
+    logAppend(msg, RGB(36, 44, 70), false);
+    logEnd();
 }
 static void sys(const std::wstring& s) { logLine(L"[시스템] " + s); }
 static void gmsg(const std::wstring& s) { logLine(L"[게임] " + s); }
@@ -300,6 +345,7 @@ static void setView(int v) {
     g_view = v;
     RECT r{0, 0, PX(CX + CW), PY(CY)};
     InvalidateRect(g_hwnd, &r, FALSE);
+    for (HWND h : hGameBtn) if (h) InvalidateRect(h, nullptr, FALSE);   // 선택된 탭 색 다시 그리기
     invalidateCanvas();
 }
 
@@ -374,13 +420,17 @@ struct Btn {
 };
 static void button(HDC dc, const Btn& b, const std::wstring& s, bool enabled = true, COLORREF col = COL_ME,
                    int size = 18) {
-    COLORREF f = enabled ? col : RGB(190, 192, 200);
-    roundRect(dc, b.x, b.y, b.w, b.h, f, darker(f), 16, 2);
+    COLORREF f = enabled ? col : RGB(212, 221, 233);
+    roundRect(dc, b.x, b.y + 4, b.w, b.h, darker(f, 0.82), darker(f, 0.82), b.h, 1);   // 아래 그림자 (말랑한 버튼)
+    roundRect(dc, b.x, b.y, b.w, b.h, f, f, b.h, 1);
+    COLORREF hi = RGB(std::min(255, GetRValue(f) + 36), std::min(255, GetGValue(f) + 36), std::min(255, GetBValue(f) + 36));
+    roundRect(dc, b.x + b.h / 4, b.y + 4, b.w - b.h / 2, b.h / 3, hi, hi, b.h / 3, 1);   // 위쪽 반짝이
     text(dc, b.x, b.y, b.w, b.h, s, size, RGB(255, 255, 255), true);
 }
 static void title(HDC dc, const std::wstring& t, const std::wstring& sub) {
-    text(dc, 20, 10, 400, 32, t, 24, COL_TEXT, true, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    text(dc, 20, 40, 600, 22, sub, 15, COL_SUB, false, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    circle(dc, 26, 26, 6, COL_MAIN, COL_MAIN, 1);
+    text(dc, 40, 10, 400, 32, t, 24, COL_TEXT, true, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    text(dc, 40, 40, 580, 22, sub, 15, COL_SUB, false, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 }
 
 // ═════════════════════════ 가위바위보 ═════════════════════════
@@ -416,7 +466,7 @@ static void drawRps(HDC dc) {
     for (int i = 0; i < 3; i++) {
         Btn b = rpsBtn(i);
         bool sel = R.my == i;
-        roundRect(dc, b.x, b.y, b.w, b.h, sel ? RGB(255, 236, 200) : RGB(255, 255, 255), sel ? COL_ACC : RGB(200, 205, 220),
+        roundRect(dc, b.x, b.y, b.w, b.h, sel ? RGB(255, 238, 214) : RGB(255, 255, 255), sel ? COL_ACC : COL_LINE,
                   24, sel ? 4 : 2);
         text(dc, b.x, b.y + 15, b.w, 95, RPS_E[i], 64, COL_TEXT, false, DT_CENTER | DT_VCENTER | DT_SINGLELINE, true);
         text(dc, b.x, b.y + 115, b.w, 40, RPS_N[i], 24, COL_TEXT, true);
@@ -549,7 +599,7 @@ static void drawTtt(HDC dc) {
     else sub = L"새 게임을 누르면 시작합니다. (시작한 사람이 X, 선공)";
     title(dc, L"틱택토", sub);
     int gx = 170, gy = 75, cs = 100;
-    roundRect(dc, gx - 8, gy - 8, cs * 3 + 16, cs * 3 + 16, RGB(255, 255, 255), RGB(210, 214, 228), 20, 2);
+    roundRect(dc, gx - 8, gy - 8, cs * 3 + 16, cs * 3 + 16, RGB(255, 255, 255), COL_LINE, 20, 2);
     for (int i = 1; i < 3; i++) {
         line(dc, gx + i * cs, gy + 6, gx + i * cs, gy + cs * 3 - 6, RGB(170, 175, 195), 4);
         line(dc, gx + 6, gy + i * cs, gx + cs * 3 - 6, gy + i * cs, RGB(170, 175, 195), 4);
@@ -689,7 +739,7 @@ static void drawOmok(HDC dc) {
         text(dc, 452, 240, 175, 90, O.result, 30, c, true, DT_CENTER | DT_WORDBREAK);
     }
     button(dc, omNew, L"새 게임", true, COL_ME);
-    button(dc, omResign, L"기권", O.on, RGB(150, 155, 170), 15);
+    button(dc, omResign, L"기권", O.on, COL_GRAY, 15);
 }
 
 // ═════════════════════════ 윷놀이 ═════════════════════════
@@ -909,7 +959,7 @@ static void drawYut(HDC dc) {
     else if (Y.throwsLeft > 0) sub = L"내 차례! 윷을 던지세요.";
     else sub = L"결과를 고르고, 움직일 내 말(또는 대기 말)을 클릭하세요.";
     title(dc, L"윷놀이", sub);
-    if (Y.on) button(dc, yutQuitBtn, L"그만", true, RGB(150, 155, 170), 14);
+    if (Y.on) button(dc, yutQuitBtn, L"그만", true, COL_GRAY, 14);
 
     // 판
     roundRect(dc, 28, 73, 354, 354, RGB(244, 226, 190), RGB(190, 150, 100), 24, 3);
@@ -958,7 +1008,7 @@ static void drawYut(HDC dc) {
     for (int i = 0; i < (int)Y.pending.size() && i < 8; i++) {
         Btn b = yutChip(i);
         bool sel = i == autoSel && myTurn && Y.throwsLeft == 0;
-        roundRect(dc, b.x, b.y, b.w, b.h, sel ? COL_ACC : RGB(255, 255, 255), sel ? darker(COL_ACC) : RGB(190, 195, 210), 12, 2);
+        roundRect(dc, b.x, b.y, b.w, b.h, sel ? COL_ACC : RGB(255, 255, 255), sel ? darker(COL_ACC) : COL_LINE, 12, 2);
         text(dc, b.x, b.y, b.w, b.h, YUT_N[Y.pending[i]], 18, sel ? RGB(255, 255, 255) : COL_TEXT, true);
     }
 
@@ -987,13 +1037,14 @@ struct Fighter {
     bool guard = false;
 };
 struct AtkInfo { int dur, a0, a1, range, dmg; };
-static const AtkInfo ATK[3] = {{0, 0, 0, 0, 0}, {16, 4, 8, 58, 7}, {26, 9, 14, 84, 12}};
+static const AtkInfo ATK[3] = {{0, 0, 0, 0, 0}, {16, 3, 9, 72, 7}, {26, 8, 15, 98, 12}};
 static struct FightState {
     bool on = false;
     int countdown = 0, goT = 0, result = 0, tick = 0, fxT = 0;
     float fxX = 0, fxY = 0;
     float ox = 0, oy = GROUND;   // 화면에 그릴 상대 위치 (네트워크 지연을 부드럽게 보정)
     bool hitDone = false, pW = false, pP = false, pK = false;
+    bool qW = false, qP = false, qK = false;   // 프레임 사이에 짧게 눌렀다 뗀 키 (WM_KEYDOWN에서 기록)
     Fighter me, op;
 } F;
 static const Btn fightBtn{230, 250, 180, 54};
@@ -1041,6 +1092,10 @@ static void fightTick() {
         P = keyDown('J') || keyDown('Z');
         K = keyDown('K') || keyDown('X');
     }
+    // 짧게 톡 친 키도 놓치지 않도록: 눌림 기록이 있으면 이번 프레임에 새로 누른 것으로 처리
+    bool newW = (J && !F.pW) || (canInput && F.qW), newP = (P && !F.pP) || (canInput && F.qP),
+         newK = (K && !F.pK) || (canInput && F.qK);
+    F.qW = F.qP = F.qK = false;
     bool onGround = m.y >= GROUND - 0.5f;
     if (m.stun > 0) {
         m.stun--;
@@ -1050,9 +1105,9 @@ static void fightTick() {
         if (m.act == 0 && !m.guard) {
             if (L) m.x -= 4.5f;
             if (Rt) m.x += 4.5f;
-            if (J && !F.pW && onGround) m.vy = -13.5f;
-            if (P && !F.pP) { m.act = 1; m.actT = 0; F.hitDone = false; }
-            else if (K && !F.pK) { m.act = 2; m.actT = 0; F.hitDone = false; }
+            if (newW && onGround) m.vy = -13.5f;
+            if (newP) { m.act = 1; m.actT = 0; F.hitDone = false; }
+            else if (newK) { m.act = 2; m.actT = 0; F.hitDone = false; }
         }
     }
     F.pW = J; F.pP = P; F.pK = K;
@@ -1069,7 +1124,8 @@ static void fightTick() {
         m.actT++;
         if (!F.hitDone && F.result == 0 && m.actT >= a.a0 && m.actT <= a.a1) {
             float dx = (F.op.x - m.x) * m.facing;
-            if (dx > 0 && dx < a.range && std::fabs(F.op.y - m.y) < 70) {
+            // 겹쳐 서 있어도(dx가 0 근처) 맞도록 약간 뒤쪽까지 허용
+            if (dx > -24 && dx < a.range && std::fabs(F.op.y - m.y) < 70) {
                 F.hitDone = true;
                 sendMsg("FHIT", std::to_string(a.dmg) + "|" + std::to_string(m.facing));
                 F.fxT = 10;
@@ -1086,7 +1142,7 @@ static void fightOnHit(int dmg, int dir) {
     bool blocked = F.me.guard && F.me.facing == -dir;
     int d = blocked ? std::max(1, dmg / 5) : dmg;
     F.me.hp -= d;
-    F.me.kb = dir * (blocked ? 3.f : 7.f);
+    F.me.kb = dir * (blocked ? 2.f : 4.f);   // 밀려나는 거리를 줄여 연속 공격이 이어지도록
     if (!blocked) { F.me.stun = 16; F.me.act = 0; }
     F.fxT = 10;
     F.fxX = F.me.x;
@@ -1189,7 +1245,7 @@ static void drawFight(HDC dc) {
         if (GetFocus() == hInput && F.result == 0)
             text(dc, 0, 60, CW, 24, L"⌨ 채팅창에 입력 중 — 조작하려면 게임 화면을 클릭하세요 (Esc)", 15, COL_OP, true);
     } else {
-        roundRect(dc, 150, 90, 340, 140, RGB(255, 255, 255), RGB(200, 205, 220), 24, 2);
+        roundRect(dc, 150, 90, 340, 140, RGB(255, 255, 255), COL_LINE, 24, 2);
         text(dc, 150, 100, 340, 40, L"🥊 격투 대전", 26, COL_TEXT, true);
         text(dc, 150, 145, 340, 70, L"먼저 HP를 0으로 만드는 사람이 승리!\n방어 중에는 데미지가 크게 줄어듭니다.", 15, COL_SUB, false,
              DT_CENTER | DT_WORDBREAK);
@@ -1953,7 +2009,7 @@ static void handleGroupNet(const std::string& line) {
         } else if (type == "WORD") {
             hostWord(from, W(payload));
         } else if (type == "CHAT" && findP(from)) {
-            logLine(L"[" + pname(from) + L"] " + W(payload));
+            chatLine(pname(from), W(payload), false);
         }
         return;
     }
@@ -1973,7 +2029,7 @@ static void handleGroupNet(const std::string& line) {
         if (type == "REJECT" && fs(0) == g_pid) relayFail(L"입장할 수 없어요: " + W(fs(1)));
         return;
     }
-    if (type == "CHAT") { logLine(L"[" + pname(from) + L"] " + W(payload)); return; }
+    if (type == "CHAT") { chatLine(pname(from), W(payload), false); return; }
     if (from != g_hostPid) return;   // 아래는 방장만 보낼 수 있는 메시지
     if (type == "SYS") sys(W(payload));
     else if (type == "KSTART") kApplyStart(W(fs(0)), fs(1), fi(2));
@@ -1986,13 +2042,13 @@ static void handleGroupNet(const std::string& line) {
 
 // ── 단체 방 화면 ──
 static void drawPlayerPanel(HDC dc, int view) {
-    roundRect(dc, 15, 75, 205, 395, RGB(255, 255, 255), RGB(210, 214, 228), 18, 2);
+    roundRect(dc, 15, 75, 205, 395, RGB(255, 255, 255), COL_LINE, 18, 2);
     text(dc, 28, 82, 180, 24, L"참가자 · 점수", 15, COL_SUB, true, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     int y = 110;
     for (auto& p : GP) {
         bool cur = view == V_WORD && K.on && p.pid == K.cur;
         bool out = view == V_WORD && K.on && !p.alive;
-        if (cur) roundRect(dc, 22, y - 2, 191, 40, RGB(255, 236, 200), COL_ACC, 12, 2);
+        if (cur) roundRect(dc, 22, y - 2, 191, 40, RGB(255, 238, 214), COL_ACC, 12, 2);
         COLORREF nc = out ? RGB(175, 178, 188) : p.pid == g_pid ? COL_ME : COL_TEXT;
         std::wstring nm = (p.pid == g_hostPid ? L"★ " : L"") + p.name + (p.pid == g_pid ? L" (나)" : L"");
         std::wstring mark;
@@ -2007,12 +2063,12 @@ static void drawPlayerPanel(HDC dc, int view) {
 }
 static void drawWord(HDC dc) {
     title(dc, L"끝말잇기", groupSub());
-    button(dc, grpCopyBtn, L"코드 복사", true, RGB(150, 155, 170), 14);
+    button(dc, grpCopyBtn, L"코드 복사", true, COL_GRAY, 14);
     drawPlayerPanel(dc, V_WORD);
     int rx = 240, rw = 390;
     if (K.on) {
         text(dc, rx, 76, rw, 22, L"현재 단어", 14, COL_SUB, true);
-        roundRect(dc, rx, 100, rw, 90, RGB(255, 255, 255), RGB(210, 214, 228), 18, 2);
+        roundRect(dc, rx, 100, rw, 90, RGB(255, 255, 255), COL_LINE, 18, 2);
         text(dc, rx, 100, rw, 90, K.last, 42, COL_TEXT, true);
         wchar_t lc = K.last.back(), d = dueum(lc);
         std::wstring need = std::wstring(L"'") + lc + L"'" + (d != lc ? std::wstring(L" 또는 '") + d + L"'" : L"") +
@@ -2023,7 +2079,7 @@ static void drawWord(HDC dc) {
              mine ? COL_ME : COL_TEXT, true);
         LONGLONG rem = std::max<LONGLONG>(0, (LONGLONG)K.deadline - (LONGLONG)GetTickCount64());
         int bw = (int)std::min<LONGLONG>(rw - 4, (rw - 4) * rem / std::max(1, K.turnMs));
-        roundRect(dc, rx, 262, rw, 18, RGB(235, 237, 243), RGB(210, 214, 228), 10, 1);
+        roundRect(dc, rx, 262, rw, 18, RGB(232, 241, 251), COL_LINE, 10, 1);
         if (bw > 0) fillRect(dc, rx + 2, 264, bw, 14, rem < 4000 ? COL_OP : COL_WINC);
         text(dc, rx, 282, rw, 20, L"남은 시간 " + I((int)((rem + 999) / 1000)) + L"초", 13, COL_SUB);
         text(dc, rx, 304, rw, 22, K.msg, 14, COL_TEXT, false, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -2035,7 +2091,7 @@ static void drawWord(HDC dc) {
             hy += 23;
         }
     } else {
-        roundRect(dc, rx, 76, rw, 118, RGB(255, 255, 255), RGB(210, 214, 228), 18, 2);
+        roundRect(dc, rx, 76, rw, 118, RGB(255, 255, 255), COL_LINE, 18, 2);
         text(dc, rx, 82, rw, 22, L"방 코드 (친구들에게 알려주세요)", 14, COL_SUB, true);
         text(dc, rx, 104, rw, 80, W(g_code), 50, COL_ME, true);
         if (!K.winner.empty()) text(dc, rx, 200, rw, 40, L"우승: " + K.winner, 26, COL_WINC, true);
@@ -2063,7 +2119,7 @@ static void drawGRps(HDC dc) {
     for (int i = 0; i < 3; i++) {
         Btn b = grpsBtn(i);
         bool sel = picked && GR.picks[g_pid] == i;
-        roundRect(dc, b.x, b.y, b.w, b.h, sel ? RGB(255, 236, 200) : RGB(255, 255, 255), sel ? COL_ACC : RGB(200, 205, 220), 20,
+        roundRect(dc, b.x, b.y, b.w, b.h, sel ? RGB(255, 238, 214) : RGB(255, 255, 255), sel ? COL_ACC : COL_LINE, 20,
                   sel ? 4 : 2);
         text(dc, b.x, b.y + 8, b.w, 80, RPS_E[i], 48, COL_TEXT, false, DT_CENTER | DT_VCENTER | DT_SINGLELINE, true);
         text(dc, b.x, b.y + 90, b.w, 32, RPS_N[i], 20, COL_TEXT, true);
@@ -2144,7 +2200,7 @@ static void drawGud(HDC dc) {
         if (e.ans == "UP") lo = std::max(lo, e.n + 1);
         if (e.ans == "DOWN") hi = std::min(hi, e.n - 1);
     }
-    roundRect(dc, rx + 70, 140, rw - 140, 56, RGB(255, 255, 255), RGB(210, 214, 228), 16, 2);
+    roundRect(dc, rx + 70, 140, rw - 140, 56, RGB(255, 255, 255), COL_LINE, 16, 2);
     text(dc, rx + 70, 140, rw - 140, 56, L"범위  " + I(lo) + L" ~ " + I(hi), 26, COL_TEXT, true);
     text(dc, rx, 210, rw, 22, L"추측 기록", 13, COL_SUB, true, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     int y = 234, n = 0;
@@ -2175,7 +2231,7 @@ static void drawPicker(HDC dc, int view) {
         Btn b = pickBtn(i);
         bool pending = g_chalTo == p.pid;
         bool busy = g_pairs.count(p.pid) > 0;
-        roundRect(dc, b.x, b.y, b.w, b.h, pending ? RGB(255, 236, 200) : RGB(255, 255, 255), pending ? COL_ACC : RGB(200, 205, 220),
+        roundRect(dc, b.x, b.y, b.w, b.h, pending ? RGB(255, 238, 214) : RGB(255, 255, 255), pending ? COL_ACC : COL_LINE,
                   16, 2);
         text(dc, b.x + 16, b.y + 6, b.w - 32, 26, p.name, 18, COL_TEXT, true, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         std::wstring s = pending ? L"신청 중... (응답 기다리는 중)"
@@ -2192,7 +2248,7 @@ static void drawChalOverlay(HDC dc) {
     std::wstring v = g_chalInView >= 0 && g_chalInView < V_COUNT ? VIEW_NAMES[g_chalInView] : L"";
     text(dc, 110, 206, 420, 40, pname(g_chalFrom) + L" 님이 " + v + L" 대결을 신청했어요!", 17, COL_TEXT, false);
     button(dc, chalYes, L"수락", true, COL_WINC, 18);
-    button(dc, chalNo, L"거절", true, RGB(150, 155, 170), 18);
+    button(dc, chalNo, L"거절", true, COL_GRAY, 18);
 }
 static void drawPairView(HDC dc, int view) {
     switch (view) {
@@ -2291,7 +2347,7 @@ static void handlePeer(const std::string& line) {
         sys(g_peer + L" 님과 연결되었습니다! 위쪽 버튼으로 게임을 고르세요. (/help)");
         updateStrip();
     } else if (type == "CHAT") {
-        logLine(L"[" + g_peer + L"] " + W(payload));
+        chatLine(g_peer, W(payload), false);
     } else if (type == "BYE") {
         sys(g_peer + L" 님이 나갔습니다.");
     }
@@ -2862,7 +2918,7 @@ static void sendChat() {
             std::wstring w;
             for (wchar_t c : t)
                 if (c != L' ' && c != L'|') w += c;
-            logLine(L"[나] " + w + L"  (제출)");
+            chatLine(L"나", w + L"  (제출)", true);
             submitWord(w);
         } else if (t[0] == L'/') {
             if (t == L"/help" || t == L"/?") printGroupHelp();
@@ -2873,14 +2929,14 @@ static void sendChat() {
             int n = _wtoi(t.c_str());   // 업다운 추측
             if (n >= 1 && n <= 100) {
                 sendMsg("GUD_GUESS", std::to_string(n));
-                logLine(L"[나] " + I(n) + L" 추측");
+                chatLine(L"나", I(n) + L" 추측", true);
             } else {
                 gmsg(L"1~100 사이 숫자를 입력하세요.");
             }
         } else {
             std::replace(t.begin(), t.end(), L'|', L'/');
             sendMsg("CHAT", U8(t));
-            logLine(L"[나] " + t);
+            chatLine(L"나", t, true);
         }
         invalidateCanvas();
         return;
@@ -2888,7 +2944,7 @@ static void sendChat() {
     if (t[0] == L'/') handleCommand(t);
     else {
         sendMsg("CHAT", U8(t));
-        logLine(L"[나] " + t);
+        chatLine(L"나", t, true);
     }
     invalidateCanvas();
 }
@@ -2908,10 +2964,19 @@ static LRESULT CALLBACK ConnEditProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PT
 
 // ═════════════════════════ 화면 ═════════════════════════
 static void drawConnect(HDC dc) {
-    text(dc, 0, 18, CW, 50, L"🎮 미니게임 채팅", 34, COL_TEXT, true);
+    // 배경 방울 장식
+    static const int BUB[][4] = {{40, 140, 34, 0}, {86, 230, 14, 1}, {58, 360, 24, 2}, {96, 440, 10, 0},
+                                 {600, 130, 28, 2}, {560, 210, 12, 0}, {596, 330, 36, 1}, {552, 430, 16, 2},
+                                 {70, 40, 12, 1}, {575, 40, 18, 0}};
+    static const COLORREF BC[3] = {RGB(212, 243, 235), RGB(220, 232, 255), RGB(255, 242, 210)};
+    for (auto& b : BUB) circle(dc, b[0], b[1], b[2], BC[b[3]], BC[b[3]], 1);
+    text(dc, 0, 14, CW, 54, L"🎮", 34, COL_TEXT, false, DT_CENTER | DT_VCENTER | DT_SINGLELINE, true);
+    text(dc, 0, 14, 268, 54, L"미니게임", 34, COL_MAIN, true, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    text(dc, 372, 14, 268, 54, L"파티", 34, COL_ME, true, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     text(dc, 0, 68, CW, 26, L"가위바위보 · 주사위 · 틱택토 · 오목 · 윷놀이 · 격투 · 업다운 · 끝말잇기 — 1:1도, 단체(8명)도!", 14, COL_SUB);
-    roundRect(dc, 125, 104, 390, 370, RGB(255, 255, 255), RGB(205, 210, 225), 24, 2);
-    line(dc, 150, 268, 490, 268, RGB(225, 228, 238), 1);
+    roundRect(dc, 125, 110, 390, 370, RGB(206, 226, 244), RGB(206, 226, 244), 32, 1);   // 카드 그림자
+    roundRect(dc, 125, 104, 390, 370, RGB(255, 255, 255), COL_LINE, 32, 2);
+    line(dc, 150, 268, 490, 268, COL_LINE, 1);
     fillRect(dc, 205, 258, 230, 20, RGB(255, 255, 255));
     text(dc, 205, 258, 230, 20, L"같은 와이파이라면 IP로 직접 연결", 13, COL_SUB);
 }
@@ -2961,6 +3026,72 @@ static HWND mk(const wchar_t* cls, const wchar_t* txt, DWORD style, int x, int y
     return hw;
 }
 
+// 둥글고 말랑한 파스텔 버튼 (BS_OWNERDRAW)
+static void drawOwnerBtn(const DRAWITEMSTRUCT* di) {
+    HWND h = di->hwndItem;
+    HDC dc = di->hDC;
+    RECT r = di->rcItem;
+    int ht = r.bottom - r.top;
+    bool down = (di->itemState & ODS_SELECTED) != 0, off = (di->itemState & ODS_DISABLED) != 0;
+    bool onCard = h == hOnline || h == hGroup || h == hCodeJoin || h == hHost || h == hJoin;   // 메인 화면 흰 카드 위
+
+    // 버튼 종류별 색: 채움색, 글자색, 테두리색
+    COLORREF fill = COL_MAIN, fg = RGB(255, 255, 255), border = 0;
+    bool outline = false;
+    int tab = -1;
+    for (int i = 0; i < g_tabCount; i++)
+        if (h == hGameBtn[i]) tab = i;
+    if (tab >= 0) {
+        bool sel = g_connected && g_tabs[tab] == g_view;
+        if (sel) fill = COL_MAIN;
+        else { fill = RGB(255, 255, 255); fg = COL_TEXT; outline = true; border = COL_LINE; }
+    } else if (h == hHomeBtn || h == hFullBtn) {
+        fill = RGB(255, 255, 255); fg = COL_TEXT; outline = true; border = COL_LINE;
+    } else if (h == hGroup) fill = COL_ME;
+    else if (h == hCodeJoin) fill = COL_ACC;
+    else if (h == hHost || h == hJoin) fill = RGB(176, 156, 226);
+    else if (h == hStripBtn) fill = COL_OP;
+    if (off) { fill = RGB(226, 233, 242); fg = RGB(158, 170, 188); outline = false; }
+    if (down) fill = darker(fill, 0.9);
+    if (!outline) border = fill;
+
+    HBRUSH bgb = CreateSolidBrush(onCard ? RGB(255, 255, 255) : COL_WIN);
+    FillRect(dc, &r, bgb);
+    DeleteObject(bgb);
+    int sh = std::max(2, ht / 10);   // 아래 그림자 두께
+    int y0 = r.top + (down ? sh : 0);
+    COLORREF shade = outline ? COL_LINE : darker(fill, 0.82);
+    if (!down) {
+        HBRUSH sb = CreateSolidBrush(shade);
+        HPEN sp = CreatePen(PS_SOLID, 1, shade);
+        HGDIOBJ ob = SelectObject(dc, sb), op = SelectObject(dc, sp);
+        RoundRect(dc, r.left, r.top + sh, r.right, r.bottom, ht, ht);
+        SelectObject(dc, ob); SelectObject(dc, op);
+        DeleteObject(sb); DeleteObject(sp);
+    }
+    HBRUSH fb = CreateSolidBrush(fill);
+    HPEN fp = CreatePen(PS_SOLID, std::max(1, ht / 18), border);
+    HGDIOBJ ob = SelectObject(dc, fb), op = SelectObject(dc, fp);
+    RoundRect(dc, r.left, y0, r.right, y0 + ht - sh, ht, ht);
+    SelectObject(dc, ob); SelectObject(dc, op);
+    DeleteObject(fb); DeleteObject(fp);
+
+    wchar_t buf[128];
+    GetWindowTextW(h, buf, 128);
+    HFONT f = (HFONT)SendMessageW(h, WM_GETFONT, 0, 0);
+    LOGFONTW lf{};
+    GetObjectW(f, sizeof(lf), &lf);
+    lf.lfWeight = FW_BOLD;
+    HFONT bf = CreateFontIndirectW(&lf);
+    HGDIOBJ of = SelectObject(dc, bf);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, fg);
+    RECT tr{r.left + 2, y0, r.right - 2, y0 + ht - sh};
+    DrawTextW(dc, buf, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    SelectObject(dc, of);
+    DeleteObject(bf);
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_CREATE: {
@@ -2971,23 +3102,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_whiteBrush = CreateSolidBrush(RGB(255, 255, 255));
             g_winBrush = CreateSolidBrush(COL_WIN);
             for (int i = 0; i < V_COUNT; i++) {   // 게임 탭 (모드에 맞게 layoutTabs에서 배치)
-                hGameBtn[i] = mk(L"BUTTON", L"", BS_PUSHBUTTON, CX + i * 80, 8, 76, 34, ID_GAME0 + i);
+                hGameBtn[i] = mk(L"BUTTON", L"", BS_OWNERDRAW, CX + i * 80, 8, 76, 34, ID_GAME0 + i);
                 ShowWindow(hGameBtn[i], SW_HIDE);
             }
             // 게임 화면 아래 상태줄
             hStrip = mk(L"STATIC", L"", SS_LEFT | SS_CENTERIMAGE | SS_ENDELLIPSIS, 14, 536, 520, 28);
-            hStripBtn = mk(L"BUTTON", L"대결 끝내기", BS_PUSHBUTTON, 540, 535, 110, 30, ID_ENDMATCH);
+            hStripBtn = mk(L"BUTTON", L"대결 끝내기", BS_OWNERDRAW, 540, 535, 110, 30, ID_ENDMATCH);
             ShowWindow(hStripBtn, SW_HIDE);
             // 채팅 칸 위: 메인 화면으로 / 전체 화면 버튼
-            hHomeBtn = mk(L"BUTTON", L"◀ 메인 화면으로", BS_PUSHBUTTON, 660, 8, 162, 32, ID_HOME);
-            hFullBtn = mk(L"BUTTON", L"전체 화면 (F11)", BS_PUSHBUTTON, 828, 8, 162, 32, ID_FULL);
+            hHomeBtn = mk(L"BUTTON", L"◀ 메인 화면으로", BS_OWNERDRAW, 660, 8, 162, 32, ID_HOME);
+            hFullBtn = mk(L"BUTTON", L"전체 화면 (F11)", BS_OWNERDRAW, 828, 8, 162, 32, ID_FULL);
             ShowWindow(hHomeBtn, SW_HIDE);
-            hLog = mk(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 660, 46, 330, 476, 0, WS_EX_CLIENTEDGE);
+            LoadLibraryW(L"Msftedit.dll");   // RichEdit 4.1 (MSFTEDIT_CLASS)
+            hLog = mk(MSFTEDIT_CLASS, L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, 660, 46, 330, 476, 0,
+                      WS_EX_CLIENTEDGE);
             g_ctl[hLog].font = 1;
-            SendMessageW(hLog, WM_SETFONT, (WPARAM)g_logFont, TRUE);
-            SendMessageW(hLog, EM_SETLIMITTEXT, 0, 0);
+            placeCtl(hLog);
+            SendMessageW(hLog, EM_EXLIMITTEXT, 0, 4 * 1024 * 1024);
+            SendMessageW(hLog, EM_SETBKGNDCOLOR, 0, RGB(255, 255, 255));
+            SendMessageW(hLog, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(S(6), S(6)));
             hInput = mk(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 660, 530, 262, 34, ID_INPUT, WS_EX_CLIENTEDGE);
-            hSend = mk(L"BUTTON", L"보내기", BS_PUSHBUTTON, 926, 530, 64, 34, ID_SEND);
+            hSend = mk(L"BUTTON", L"보내기", BS_OWNERDRAW, 926, 530, 64, 34, ID_SEND);
             EnableWindow(hInput, FALSE);
             EnableWindow(hSend, FALSE);
             SetWindowSubclass(hInput, InputProc, 1, 0);
@@ -2996,24 +3131,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int ox = CX, oy = CY;
             hLblName = mk(L"STATIC", L"닉네임", SS_CENTERIMAGE, ox + 150, oy + 120, 70, 30);
             hName = mk(L"EDIT", L"플레이어", ES_AUTOHSCROLL | WS_TABSTOP, ox + 225, oy + 120, 265, 30, 0, WS_EX_CLIENTEDGE);
-            hOnline = mk(L"BUTTON", L"1:1 방 만들기", BS_PUSHBUTTON | WS_TABSTOP, ox + 150, oy + 162, 166, 42, ID_ONLINE);
-            hGroup = mk(L"BUTTON", L"단체 방 (최대 8명)", BS_PUSHBUTTON | WS_TABSTOP, ox + 324, oy + 162, 166, 42, ID_GROUP);
+            hOnline = mk(L"BUTTON", L"1:1 방 만들기", BS_OWNERDRAW | WS_TABSTOP, ox + 150, oy + 162, 166, 42, ID_ONLINE);
+            hGroup = mk(L"BUTTON", L"단체 방 (최대 8명)", BS_OWNERDRAW | WS_TABSTOP, ox + 324, oy + 162, 166, 42, ID_GROUP);
             hLblCode = mk(L"STATIC", L"방 코드", SS_CENTERIMAGE, ox + 150, oy + 215, 70, 32);
             hCode = mk(L"EDIT", L"", ES_AUTOHSCROLL | ES_UPPERCASE | WS_TABSTOP, ox + 225, oy + 215, 140, 32, 0, WS_EX_CLIENTEDGE);
             SendMessageW(hCode, EM_SETLIMITTEXT, 8, 0);
             SendMessageW(hCode, EM_SETCUEBANNER, TRUE, (LPARAM)L"예) 1K7F3Q");
-            hCodeJoin = mk(L"BUTTON", L"코드로 참가", BS_PUSHBUTTON | WS_TABSTOP, ox + 372, oy + 214, 118, 34, ID_CODEJOIN);
+            hCodeJoin = mk(L"BUTTON", L"코드로 참가", BS_OWNERDRAW | WS_TABSTOP, ox + 372, oy + 214, 118, 34, ID_CODEJOIN);
             hLblIp = mk(L"STATIC", L"상대 IP", SS_CENTERIMAGE, ox + 150, oy + 286, 70, 30);
             hIp = mk(L"EDIT", L"127.0.0.1", ES_AUTOHSCROLL | WS_TABSTOP, ox + 225, oy + 286, 170, 30, 0, WS_EX_CLIENTEDGE);
             hPort = mk(L"EDIT", L"5555", ES_AUTOHSCROLL | ES_NUMBER | WS_TABSTOP, ox + 400, oy + 286, 90, 30, 0, WS_EX_CLIENTEDGE);
-            hHost = mk(L"BUTTON", L"IP로 방 만들기", BS_PUSHBUTTON | WS_TABSTOP, ox + 150, oy + 324, 165, 34, ID_HOST);
-            hJoin = mk(L"BUTTON", L"IP로 참가", BS_PUSHBUTTON | WS_TABSTOP, ox + 325, oy + 324, 165, 34, ID_JOIN);
+            hHost = mk(L"BUTTON", L"IP로 방 만들기", BS_OWNERDRAW | WS_TABSTOP, ox + 150, oy + 324, 165, 34, ID_HOST);
+            hJoin = mk(L"BUTTON", L"IP로 참가", BS_OWNERDRAW | WS_TABSTOP, ox + 325, oy + 324, 165, 34, ID_JOIN);
             hStatus = mk(L"STATIC", L"온라인 방을 만들어 친구에게 코드를 보내거나,\n친구에게 받은 코드를 입력하세요.", SS_CENTER, ox + 140, oy + 368, 360, 100);
             SetWindowSubclass(hIp, ConnEditProc, 2, ID_JOIN);
             SetWindowSubclass(hCode, ConnEditProc, 3, ID_CODEJOIN);
             SetTimer(hwnd, 1, 16, nullptr);
             return 0;
         }
+        case WM_DRAWITEM:
+            if (((DRAWITEMSTRUCT*)lp)->CtlType == ODT_BUTTON) { drawOwnerBtn((DRAWITEMSTRUCT*)lp); return TRUE; }
+            break;
         case WM_CTLCOLORSTATIC: {
             HDC dc = (HDC)wp;
             if ((HWND)lp == hStrip) {   // 상태줄은 창 배경색
@@ -3124,6 +3262,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_KEYDOWN:
+            if (F.on && !(lp & 0x40000000)) {   // 격투: 새로 누른 키를 기록 (자동 반복 제외)
+                if (wp == 'J' || wp == 'Z') F.qP = true;
+                if (wp == 'K' || wp == 'X') F.qK = true;
+                if (wp == 'W' || wp == VK_UP) F.qW = true;
+            }
             if (wp == VK_RETURN && g_connected) SetFocus(hInput);
             if (wp == VK_ESCAPE && g_full) setFullscreen(false);
             return 0;
@@ -3139,13 +3282,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             HBRUSH bg = CreateSolidBrush(COL_WIN);
             FillRect(hdc, &cr, bg);
             DeleteObject(bg);
-            for (int i = 0; g_connected && i < g_tabCount; i++) {   // 선택된 탭 아래 주황 막대
-                if (g_tabs[i] != g_view) continue;
-                RECT ind{PX(CX + i * g_btnStep), PY(43), PX(CX + i * g_btnStep + g_btnW), PY(47)};
-                HBRUSH ab = CreateSolidBrush(COL_ACC);
-                FillRect(hdc, &ind, ab);
-                DeleteObject(ab);
-            }
             SelectClipRgn(hdc, nullptr);
             HDC mem = CreateCompatibleDC(hdc);
             HBITMAP bmp = CreateCompatibleBitmap(hdc, cw, ch);
