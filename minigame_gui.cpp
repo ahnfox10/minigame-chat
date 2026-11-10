@@ -59,7 +59,7 @@ static const Broker BROKERS[] = {{"broker.hivemq.com", 1883}, {"test.mosquitto.o
 static const int SLOW_BROKER = 2;
 static const int NBROKER = 3;
 static const char* CODE_ABC = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-static const std::string TOPIC_BASE = "mgparty-rhkwptq/v2/";
+static const std::string TOPIC_BASE = "mgparty-rhkwptq/v3/";
 
 const int CX = 10, CY = 50, CW = 640, CH = 480;      // 게임 화면(논리 좌표)
 static int g_btnW = 88, g_btnStep = 92;              // 탭 버튼 크기
@@ -88,11 +88,12 @@ static int g_view = V_WORD;
 static std::mt19937 g_rng{std::random_device{}()};
 
 // 플레이어 꾸미기: 색 · 머리 장식 (다른 사람에게도 보임) / 게임 판 테마 (내 화면에만 적용)
-static int g_myColor = 0, g_myHat = 1, g_theme = 0;
+static int g_myColor = 0, g_myHat = 1, g_theme = 0, g_myPiece = 0;
 static const COLORREF PCOL[8] = {RGB(96, 134, 240), RGB(240, 100, 92),  RGB(52, 184, 128),  RGB(255, 168, 56),
                                  RGB(160, 120, 232), RGB(38, 188, 212), RGB(240, 120, 180), RGB(146, 112, 84)};
-static const int HAT_COUNT = 6, THEME_COUNT = 4;
+static const int HAT_COUNT = 6, THEME_COUNT = 4, PIECE_COUNT = 6;
 static const wchar_t* HAT_N[HAT_COUNT] = {L"없음", L"머리띠", L"왕관", L"고깔", L"고양이 귀", L"뿔"};
+static const wchar_t* PIECE_N[PIECE_COUNT] = {L"동글", L"별", L"하트", L"보석", L"고양이", L"내 얼굴"};   // 윷놀이 말 모양
 struct Theme { const wchar_t* name; COLORREF board, edge, line, node; };
 static const Theme THEMES[THEME_COUNT] = {
     {L"나무", RGB(232, 192, 125), RGB(180, 135, 70), RGB(120, 82, 40), RGB(255, 250, 235)},
@@ -518,6 +519,7 @@ static void loadCfg() {
     g_myColor = (int)(GetPrivateProfileIntW(L"me", L"color", 0, p.c_str()) % 8);
     g_myHat = (int)(GetPrivateProfileIntW(L"me", L"hat", 1, p.c_str()) % HAT_COUNT);
     g_theme = (int)(GetPrivateProfileIntW(L"me", L"theme", 0, p.c_str()) % THEME_COUNT);
+    g_myPiece = (int)(GetPrivateProfileIntW(L"me", L"piece", 0, p.c_str()) % PIECE_COUNT);
     wchar_t nm[64] = L"";
     GetPrivateProfileStringW(L"me", L"name", L"", nm, 64, p.c_str());
     g_savedName = nm;
@@ -527,6 +529,7 @@ static void saveCfg() {
     WritePrivateProfileStringW(L"me", L"color", I(g_myColor).c_str(), p.c_str());
     WritePrivateProfileStringW(L"me", L"hat", I(g_myHat).c_str(), p.c_str());
     WritePrivateProfileStringW(L"me", L"theme", I(g_theme).c_str(), p.c_str());
+    WritePrivateProfileStringW(L"me", L"piece", I(g_myPiece).c_str(), p.c_str());
     if (!g_myName.empty()) WritePrivateProfileStringW(L"me", L"name", g_myName.c_str(), p.c_str());
 }
 
@@ -537,7 +540,7 @@ struct GPlayer {
     std::wstring name;
     int score = 0;
     bool alive = false;       // 끝말잇기에서 아직 탈락하지 않음
-    int color = 0, hat = 0;   // 꾸미기
+    int color = 0, hat = 0, piece = 0;   // 꾸미기 (색 · 머리 장식 · 윷놀이 말 모양)
 };
 static std::vector<GPlayer> GP;   // 참가자 (끝말잇기 중에는 이 순서가 차례 순서)
 
@@ -561,6 +564,11 @@ static int phat(const std::string& pid) {
     GPlayer* p = findP(pid);
     return p ? p->hat % HAT_COUNT : 0;
 }
+static int ppiece(const std::string& pid) {
+    if (pid == g_pid) return g_myPiece;
+    GPlayer* p = findP(pid);
+    return p ? p->piece % PIECE_COUNT : 0;
+}
 static std::wstring safeName(std::wstring s) {
     for (wchar_t& c : s)
         if (c == L'|' || c == L',' || c == L';') c = L' ';
@@ -571,7 +579,7 @@ static void grpSendRoster() {
     for (auto& p : GP) {
         if (!s.empty()) s += ";";
         s += p.pid + "," + std::to_string(p.score) + "," + (p.alive ? "1" : "0") + "," + std::to_string(p.color) + "," +
-             std::to_string(p.hat) + "," + U8(p.name);
+             std::to_string(p.hat) + "," + std::to_string(p.piece) + "," + U8(p.name);
     }
     sendMsg("ROSTER", s);
 }
@@ -579,14 +587,15 @@ static void grpParseRoster(const std::string& s) {
     GP.clear();
     for (auto& e : split(s, ';')) {
         auto f = split(e, ',');
-        if (f.size() < 6) continue;
+        if (f.size() < 7) continue;
         GPlayer p;
         p.pid = f[0];
         p.score = atoi(f[1].c_str());
         p.alive = f[2] == "1";
         p.color = atoi(f[3].c_str()) & 7;
         p.hat = (atoi(f[4].c_str()) % HAT_COUNT + HAT_COUNT) % HAT_COUNT;
-        p.name = W(f[5]);
+        p.piece = (atoi(f[5].c_str()) % PIECE_COUNT + PIECE_COUNT) % PIECE_COUNT;
+        p.name = W(f[6]);
         GP.push_back(p);
     }
 }
@@ -634,6 +643,56 @@ static void drawHead(HDC dc, int cx, int cy, int r, COLORREF col, int hat) {
     circle(dc, cx + r * 4 / 10, cy + r / 10, e, COL_TEXT, COL_TEXT, 1);
     drawHat(dc, cx, cy, r, hat, col);
 }
+// 윷놀이 말: 각자 고른 모양 (0 동글, 1 별, 2 하트, 3 보석, 4 고양이, 5 내 얼굴)
+static void drawPiece(HDC dc, int cx, int cy, int r, int shape, COLORREF col, int hat) {
+    COLORREF dk = darker(col, 0.62), hi = mix(col, RGB(255, 255, 255), 0.7);
+    int pw = std::max(1, r / 6);
+    switch (shape) {
+        case 1: {   // 별
+            POINT p[10];
+            for (int i = 0; i < 10; i++) {
+                double a = -1.5708 + i * 0.62832, rr = (i % 2) ? r * 0.52 : r * 1.18;
+                p[i] = {(LONG)std::lround(cx + std::cos(a) * rr), (LONG)std::lround(cy + std::sin(a) * rr)};
+            }
+            poly(dc, p, 10, col, dk, pw);
+            break;
+        }
+        case 2: {   // 하트
+            POINT p[24];
+            for (int i = 0; i < 24; i++) {
+                double t = i * 6.28318 / 24, sn = std::sin(t);
+                double hx = 16 * sn * sn * sn, hy = -(13 * std::cos(t) - 5 * std::cos(2 * t) - 2 * std::cos(3 * t) - std::cos(4 * t));
+                p[i] = {(LONG)std::lround(cx + hx * r / 14.5), (LONG)std::lround(cy - r * 0.12 + hy * r / 14.5)};
+            }
+            poly(dc, p, 24, col, dk, pw);
+            break;
+        }
+        case 3: {   // 보석
+            POINT p[4] = {{cx, cy - r * 12 / 10}, {cx + r, cy}, {cx, cy + r * 12 / 10}, {cx - r, cy}};
+            poly(dc, p, 4, col, dk, pw);
+            line(dc, cx - r / 2, cy, cx, cy - r * 6 / 10, hi, pw);
+            return;
+        }
+        case 4: {   // 고양이
+            POINT a[3] = {{cx - r, cy - r * 3 / 10}, {cx - r * 9 / 10, cy - r * 13 / 10}, {cx - r * 2 / 10, cy - r * 8 / 10}};
+            POINT b[3] = {{cx + r, cy - r * 3 / 10}, {cx + r * 9 / 10, cy - r * 13 / 10}, {cx + r * 2 / 10, cy - r * 8 / 10}};
+            poly(dc, a, 3, col, dk, pw);
+            poly(dc, b, 3, col, dk, pw);
+            circle(dc, cx, cy, r * 95 / 100, col, dk, pw);
+            int e = std::max(1, r / 6);
+            circle(dc, cx - r * 4 / 10, cy - r / 10, e, RGB(255, 255, 255), RGB(255, 255, 255), 1);
+            circle(dc, cx + r * 4 / 10, cy - r / 10, e, RGB(255, 255, 255), RGB(255, 255, 255), 1);
+            circle(dc, cx, cy + r * 3 / 10, std::max(1, r / 8), dk, dk, 1);
+            return;
+        }
+        case 5:   // 내 얼굴 (머리 장식 포함)
+            drawHead(dc, cx, cy + r / 6, r * 9 / 10, col, hat);
+            return;
+        default:
+            circle(dc, cx, cy, r * 93 / 100, col, dk, pw);
+    }
+    circle(dc, cx - r / 3, cy - r / 3, std::max(1, r / 5), hi, hi, 1);
+}
 
 // ═════════════════════════ 대결 (초대해서 하는 게임) 공통 ═════════════════════════
 // 초대한 사람이 참가자 순서(m)와 난수 씨앗(seed)을 정해 모두에게 알리면, 각자 같은 상태로 게임을 시작한다.
@@ -675,6 +734,7 @@ static std::wstring mName(int i) {
 }
 static COLORREF mCol(int i) { return i < 0 || i >= (int)M.m.size() ? COL_GRAY : pcolor(M.m[i]); }
 static int mHat(int i) { return i < 0 || i >= (int)M.m.size() ? 0 : phat(M.m[i]); }
+static int mPiece(int i) { return i < 0 || i >= (int)M.m.size() ? 0 : ppiece(M.m[i]); }
 static void reportResult(int winIdx);   // 판이 끝났을 때 (winIdx < 0 = 무승부). 대표 한 명만 방 전체에 알림
 static void hostAward(const std::vector<std::string>& pids, int pts);
 static void updateStrip();
@@ -1084,9 +1144,11 @@ static void yutDraw(HDC dc) {
         for (auto& kv : cnt) {
             POINT pt = yutXY(kv.first);
             if (s == me && myTurn && Y.throwsLeft == 0) ring(dc, pt.x, pt.y, 17, COL_ACC, 4);
-            circle(dc, pt.x, pt.y, 13, c, darker(c, 0.65), 2);
-            if (kv.second > 1) text(dc, pt.x - 13, pt.y - 13, 26, 26, I(kv.second), 15, RGB(255, 255, 255), true);
-            else circle(dc, pt.x - 4, pt.y - 4, 3, mix(c, RGB(255, 255, 255), 0.7), mix(c, RGB(255, 255, 255), 0.7), 1);
+            drawPiece(dc, pt.x, pt.y, 14, mPiece(s), c, mHat(s));
+            if (kv.second > 1) {   // 업은 말 수
+                circle(dc, pt.x + 12, pt.y - 11, 8, RGB(255, 255, 255), darker(c, 0.6), 2);
+                text(dc, pt.x + 4, pt.y - 19, 16, 16, I(kv.second), 11, COL_TEXT, true);
+            }
         }
     }
 
@@ -1122,7 +1184,7 @@ static void yutDraw(HDC dc) {
         int x = 28 + s * colW, home = 0, done = 0;
         for (int k = 0; k < Y.np; k++) { home += Y.pos[s][k] == HOME; done += Y.pos[s][k] == DONE; }
         COLORREF c = M.here[s] ? mCol(s) : COL_GRAY;
-        circle(dc, x + 10, 446, 8, c, darker(c, 0.65), 2);
+        drawPiece(dc, x + 10, 447, 9, M.here[s] ? mPiece(s) : 0, c, mHat(s));
         text(dc, x + 24, 434, colW - 30, 22, mName(s), 14, M.here[s] ? COL_TEXT : COL_GRAY, true,
              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         text(dc, x + 24, 455, colW - 30, 20, M.here[s] ? L"대기 " + I(home) + L" · 완주 " + I(done) + L"/" + I(Y.np) : std::wstring(L"나감"), 12,
@@ -1425,7 +1487,8 @@ static void fightDraw(HDC dc) {
 
 
 // ═════════════════════════ 레이싱 (2~8명) ═════════════════════════
-// 위에서 내려다보는 서킷 3바퀴. 각자 자기 차만 계산해서 위치를 보내고, 다른 차는 받은 위치로 부드럽게 따라 그린다.
+// 서킷 3바퀴. 계산은 위에서 본 평면 지도 위에서 하고, 화면은 운전석에서 보는 1인칭으로 그린다 (미니맵은 오른쪽 위).
+// 각자 자기 차만 계산해서 위치를 보내고, 다른 차는 받은 위치로 부드럽게 따라 그린다.
 struct V2 { float x, y; };
 const float RW = 2400, RH = 1500, R_HALF = 64;   // 맵 크기, 도로 반폭
 const int R_LAPS = 3;
@@ -1467,6 +1530,36 @@ static void raceBuild(int t) {
         }
     }
 }
+// 1인칭 화면용 바닥 지도: 맵을 4px 칸으로 나눠 도로 · 연석 · 잔디 등을 미리 칠해 둔다 (경기 시작 때 한 번)
+const int RT_S = 4, RT_W = (int)RW / RT_S, RT_H = (int)RH / RT_S;
+static std::vector<unsigned char> g_rtex;   // 0 잔디, 1 도로, 2 흰 연석, 3 빨간 연석, 4 가운데 점선, 5 출발선, 6 부스트 발판
+static void rtDisc(float x, float y, float r, unsigned char v) {
+    int x0 = std::max(0, (int)((x - r) / RT_S)), x1 = std::min(RT_W - 1, (int)((x + r) / RT_S));
+    int y0 = std::max(0, (int)((y - r) / RT_S)), y1 = std::min(RT_H - 1, (int)((y + r) / RT_S));
+    for (int yy = y0; yy <= y1; yy++)
+        for (int xx = x0; xx <= x1; xx++) {
+            float dx = (xx + 0.5f) * RT_S - x, dy = (yy + 0.5f) * RT_S - y;
+            if (dx * dx + dy * dy <= r * r) g_rtex[yy * RT_W + xx] = v;
+        }
+}
+static void raceBake() {
+    g_rtex.assign(RT_W * RT_H, 0);
+    int N = (int)RC.pts.size();
+    for (int pass = 0; pass < 3; pass++)   // 연석 → 도로 → 가운데 점선 순서로 덮어 칠함
+        for (int i = 0; i < N; i++) {
+            V2 a = RC.pts[i], b = RC.pts[(i + 1) % N];
+            for (int k = 0; k < 4; k++) {
+                float x = a.x + (b.x - a.x) * k / 4, y = a.y + (b.y - a.y) * k / 4;
+                if (pass == 0) rtDisc(x, y, R_HALF + 10, (i / 2) % 2 ? 3 : 2);
+                else if (pass == 1) rtDisc(x, y, R_HALF, 1);
+                else if (i % 3 == 0) rtDisc(x, y, 3, 4);
+            }
+        }
+    V2 a = RC.pts[0], b = RC.pts[1];
+    float ang = std::atan2(b.y - a.y, b.x - a.x), nx = -std::sin(ang), ny = std::cos(ang);
+    for (float t = -R_HALF; t <= R_HALF; t += 2) rtDisc(a.x + nx * t, a.y + ny * t, 6, 5);
+    for (int p : {N / 4, N / 2, N * 3 / 4}) rtDisc(RC.pts[p].x, RC.pts[p].y, 24, 6);
+}
 static float raceDirAt(int k) {
     int N = (int)RC.pts.size();
     V2 a = RC.pts[((k % N) + N) % N], b = RC.pts[((k + 1) % N + N) % N];
@@ -1479,6 +1572,7 @@ static void raceStart() {
     RC.me = mMe();
     RC.track = (int)((M.seed >> 3) % 2);
     raceBuild(RC.track);
+    raceBake();
     for (int i = 0; i < RC.n; i++) {   // 출발선 뒤 2열 정렬
         int k = 12 - (i / 2) * 3;
         float a = raceDirAt(k), side = (i % 2) ? 30.f : -30.f;
@@ -1651,53 +1745,115 @@ static void raceCar(HDC dc, float sx, float sy, float ang, COLORREF col, bool ni
         text(dc, (int)sx - 60, (int)sy - 38, 120, 16, name, 12, RGB(255, 255, 255), true);
     }
 }
+// 뒤에서 본 다른 차 (sx = 화면 가로 중심, gy = 바퀴가 닿는 높이, s = 맵 1칸이 화면에서 차지하는 픽셀)
+static void raceCarRear(HDC dc, int sx, int gy, float s, COLORREF col, bool nitro, const std::wstring& name) {
+    int w = std::max(4, (int)(42 * s)), h = std::max(3, (int)(26 * s));
+    COLORREF dk = darker(col, 0.6);
+    int ww = std::max(1, w / 5), wh = std::max(1, h / 3);
+    fastRect(dc, sx - w / 2 - ww / 3, gy - wh, ww, wh, RGB(34, 38, 50));
+    fastRect(dc, sx + w / 2 - ww + ww / 3, gy - wh, ww, wh, RGB(34, 38, 50));
+    roundRect(dc, sx - w / 2, gy - h, w, h - wh / 2, col, dk, std::max(2, h / 3), std::max(1, h / 14));
+    roundRect(dc, sx - w * 3 / 10, gy - h + h / 8, w * 6 / 10, h / 3, RGB(214, 238, 252), dk, std::max(2, h / 6), std::max(1, h / 18));
+    fastRect(dc, sx - w * 4 / 10, gy - h / 2, std::max(1, w / 7), std::max(1, h / 8), RGB(255, 90, 80));
+    fastRect(dc, sx + w * 4 / 10 - std::max(1, w / 7), gy - h / 2, std::max(1, w / 7), std::max(1, h / 8), RGB(255, 90, 80));
+    if (nitro) circle(dc, sx, gy - wh / 2, std::max(2, h / 4), RGB(255, 205, 70), RGB(255, 120, 40), std::max(1, h / 12));
+    if (w > 26 && !name.empty()) {
+        int fs = std::max(11, std::min(18, w / 6));
+        text(dc, sx - 79, gy - h - fs - 7, 160, fs + 6, name, fs, RGB(30, 36, 50), true);
+        text(dc, sx - 80, gy - h - fs - 8, 160, fs + 6, name, fs, RGB(255, 255, 255), true);
+    }
+}
+// 1인칭 화면: 운전석에서 보듯 바닥을 원근법으로 그린다 (작은 픽셀 버퍼에 그려서 확대)
+static void raceView3D(HDC dc, int view) {
+    const int W = 320, H = 240, HOR = 96;
+    const float camH = 30.f, foc = 190.f;
+    static std::vector<unsigned> px(W * H);
+    static const int SKY[THEME_COUNT][2][3] = {{{112, 166, 236}, {206, 230, 250}}, {{16, 22, 56}, {64, 84, 136}},
+                                               {{250, 196, 214}, {255, 238, 242}}, {{140, 212, 226}, {226, 248, 240}}};
+    static const int GRASS[THEME_COUNT][2][3] = {{{126, 190, 108}, {112, 176, 96}}, {{52, 84, 96}, {44, 72, 86}},
+                                                 {{246, 200, 214}, {236, 184, 202}}, {{150, 214, 190}, {134, 200, 176}}};
+    const RCar& mc = RC.c[view];
+    float ca = std::cos(mc.ang), sa = std::sin(mc.ang);
+    float camx = mc.x - ca * 10, camy = mc.y - sa * 10;
+    const int* fogc = SKY[g_theme][1];
+    for (int y = 0; y < HOR; y++) {
+        int r = SKY[g_theme][0][0] + (SKY[g_theme][1][0] - SKY[g_theme][0][0]) * y / HOR;
+        int g = SKY[g_theme][0][1] + (SKY[g_theme][1][1] - SKY[g_theme][0][1]) * y / HOR;
+        int b = SKY[g_theme][0][2] + (SKY[g_theme][1][2] - SKY[g_theme][0][2]) * y / HOR;
+        unsigned c = (unsigned)((r << 16) | (g << 8) | b);
+        for (int x = 0; x < W; x++) px[y * W + x] = c;
+    }
+    for (int y = HOR; y < H; y++) {
+        float d = camH * foc / (y - HOR + 0.5f);          // 이 줄에 보이는 바닥까지의 거리
+        float sx = -sa * d / foc, sy = ca * d / foc;       // 화면 한 픽셀 옆 = 맵에서 이만큼
+        float wx = camx + ca * d - sx * (W / 2), wy = camy + sa * d - sy * (W / 2);
+        int fog = std::min(215, (int)(d * 256 / 2000));    // 멀수록 하늘색에 섞임
+        unsigned* row = &px[y * W];
+        for (int x = 0; x < W; x++, wx += sx, wy += sy) {
+            int r, g, b;
+            int ix = (int)wx, iy = (int)wy;
+            unsigned char code = (wx < 0 || wy < 0 || wx >= RW || wy >= RH) ? 255 : g_rtex[(iy / RT_S) * RT_W + ix / RT_S];
+            switch (code) {
+                case 1: { int v = ((ix / 40 + iy / 40) & 1) ? 96 : 90; r = v; g = v + 6; b = v + 22; break; }
+                case 2: r = 242; g = 242; b = 246; break;
+                case 3: r = 228; g = 72; b = 72; break;
+                case 4: r = 226; g = 230; b = 238; break;
+                case 5: if ((ix / 10 + iy / 10) & 1) { r = g = b = 245; } else { r = g = b = 34; } break;
+                case 6: r = 255; g = 214; b = 80; break;
+                default: {
+                    const int* gc = GRASS[g_theme][(((ix + 4000) / 110 + (iy + 4000) / 110) & 1)];
+                    r = gc[0]; g = gc[1]; b = gc[2];
+                    if (code == 255) { r = r * 3 / 4; g = g * 3 / 4; b = b * 3 / 4; }   // 맵 바깥
+                }
+            }
+            r += ((fogc[0] - r) * fog) >> 8;
+            g += ((fogc[1] - g) * fog) >> 8;
+            b += ((fogc[2] - b) * fog) >> 8;
+            row[x] = (unsigned)((r << 16) | (g << 8) | b);
+        }
+    }
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = W;
+    bmi.bmiHeader.biHeight = -H;   // 위에서 아래로
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    SetStretchBltMode(dc, COLORONCOLOR);
+    StretchDIBits(dc, 0, 0, CW, CH, 0, 0, W, H, px.data(), &bmi, DIB_RGB_COLORS, SRCCOPY);
+    // 다른 차 (먼 차부터)
+    const float k = (float)CW / W;   // 버퍼 → 화면 배율
+    std::vector<std::pair<float, int>> cars;
+    for (int i = 0; i < RC.n; i++) {
+        if (i == view || !M.here[i]) continue;
+        float rx = RC.c[i].x - camx, ry = RC.c[i].y - camy, depth = rx * ca + ry * sa;
+        if (depth > 14) cars.push_back({depth, i});
+    }
+    std::sort(cars.begin(), cars.end(), [](const std::pair<float, int>& a, const std::pair<float, int>& b) { return a.first > b.first; });
+    for (auto& c : cars) {
+        const RCar& o = RC.c[c.second];
+        float rx = o.x - camx, ry = o.y - camy, depth = c.first, lat = -rx * sa + ry * ca;
+        float s = foc / depth * k;
+        raceCarRear(dc, (int)(CW / 2 + lat * s), (int)(HOR * k + camH * s), s, mCol(c.second), o.nitro, mName(c.second));
+    }
+    // 내 차 앞부분 (보닛)
+    COLORREF my = mCol(view), dk = darker(my, 0.6);
+    POINT hood[4] = {{170, CH}, {236, CH - 54}, {404, CH - 54}, {470, CH}};
+    poly(dc, hood, 4, my, dk, 3);
+    POINT shine[4] = {{262, CH - 46}, {378, CH - 46}, {392, CH - 30}, {248, CH - 30}};
+    poly(dc, shine, 4, mix(my, RGB(255, 255, 255), 0.35), mix(my, RGB(255, 255, 255), 0.35), 1);
+    if (mc.nitro) {   // 빨라질 때 속도선
+        for (int i = 0; i < 6; i++) {
+            int x = 40 + ((i * 97 + (int)(GetTickCount64() / 40) * 31) % 560), y = 230 + (i * 53) % 150;
+            line(dc, x, y, x + (x < CW / 2 ? -26 : 26), y + 16, RGB(255, 255, 255), 2);
+        }
+    }
+}
 static void raceDraw(HDC dc) {
     int N = (int)RC.pts.size();
     int view = RC.me >= 0 ? RC.me : 0;
     const RCar& mc = RC.c[view];
-    float camx = std::max(0.f, std::min(RW - CW, mc.x - CW / 2)), camy = std::max(0.f, std::min(RH - CH, mc.y - CH / 2));
-    // 잔디 (바둑판 무늬로 움직임이 느껴지게)
-    static const COLORREF GRASS[THEME_COUNT][2] = {{RGB(126, 190, 108), RGB(118, 182, 100)}, {RGB(52, 84, 96), RGB(46, 76, 90)},
-                                                   {RGB(246, 200, 214), RGB(240, 190, 206)}, {RGB(150, 214, 190), RGB(140, 206, 182)}};
-    fastRect(dc, 0, 0, CW, CH, GRASS[g_theme][0]);
-    for (int gy = (int)(camy / 160); gy * 160 < camy + CH; gy++)
-        for (int gx = (int)(camx / 160); gx * 160 < camx + CW; gx++)
-            if ((gx + gy) & 1) fastRect(dc, (int)(gx * 160 - camx), (int)(gy * 160 - camy), 160, 160, GRASS[g_theme][1]);
-    // 도로
-    std::vector<POINT> sp(N + 1);
-    for (int i = 0; i <= N; i++) sp[i] = {(LONG)std::lround(RC.pts[i % N].x - camx), (LONG)std::lround(RC.pts[i % N].y - camy)};
-    auto stroke = [&](int w, COLORREF col, int style) {
-        HPEN p = CreatePen(style, w, col);
-        HGDIOBJ op = SelectObject(dc, p);
-        Polyline(dc, sp.data(), N + 1);
-        SelectObject(dc, op);
-        DeleteObject(p);
-    };
-    stroke((int)(R_HALF * 2 + 14), RGB(240, 240, 244), PS_SOLID);
-    stroke((int)(R_HALF * 2), RGB(88, 94, 110), PS_SOLID);
-    SetBkMode(dc, TRANSPARENT);
-    stroke(1, RGB(200, 204, 214), PS_DASH);
-    // 출발선 · 부스트 발판
-    {
-        float a = raceDirAt(0);
-        float nx = -std::sin(a), ny = std::cos(a), px = RC.pts[0].x - camx, py = RC.pts[0].y - camy;
-        line(dc, (int)(px - nx * R_HALF), (int)(py - ny * R_HALF), (int)(px + nx * R_HALF), (int)(py + ny * R_HALF), RGB(255, 255, 255), 9);
-        for (int k = -3; k <= 3; k += 2)
-            circle(dc, (int)(px + nx * k * 16), (int)(py + ny * k * 16), 4, RGB(40, 44, 56), RGB(40, 44, 56), 1);
-    }
-    for (int p : {N / 4, N / 2, N * 3 / 4}) {
-        int px = (int)(RC.pts[p].x - camx), py = (int)(RC.pts[p].y - camy);
-        if (px < -40 || py < -40 || px > CW + 40 || py > CH + 40) continue;
-        circle(dc, px, py, 22, RGB(255, 214, 80), RGB(240, 150, 30), 3);
-        text(dc, px - 22, py - 14, 44, 28, L"»", 24, RGB(200, 100, 10), true);
-    }
-    // 차 (내 차를 맨 위에)
-    for (int pass = 0; pass < 2; pass++)
-        for (int i = 0; i < RC.n; i++) {
-            if (!M.here[i] || (i == view) != (pass == 1)) continue;
-            const RCar& c = RC.c[i];
-            raceCar(dc, c.x - camx, c.y - camy, c.ang, mCol(i), c.nitro, mName(i));
-        }
+    raceView3D(dc, view);
     // HUD
     std::vector<int> rank = raceRank();
     int myRank = 1;
@@ -1714,18 +1870,18 @@ static void raceDraw(HDC dc) {
     for (int i = 0; i < 3; i++) circle(dc, 76 + i * 16, 90, 5, i < RC.nitroLeft ? COL_ACC : RGB(226, 233, 242), i < RC.nitroLeft ? darker(COL_ACC) : COL_LINE, 1);
     // 미니맵
     {
-        const float ms = 0.058f;
-        int mx = CW - 150, my = 10;
-        roundRect(dc, mx, my, 140, 92, RGB(255, 255, 255), COL_LINE, 16, 2);
+        const float ms = 0.042f;   // 작은 미니맵 (오른쪽 위)
+        int mx = CW - 112, my = 10;
+        roundRect(dc, mx, my, 102, 68, RGB(255, 255, 255), COL_LINE, 14, 2);
         std::vector<POINT> mp(N + 1);
         for (int i = 0; i <= N; i++) mp[i] = {(LONG)(mx + 1 + RC.pts[i % N].x * ms), (LONG)(my + 3 + RC.pts[i % N].y * ms)};
-        HPEN p = CreatePen(PS_SOLID, 4, RGB(170, 178, 196));
+        HPEN p = CreatePen(PS_SOLID, 3, RGB(170, 178, 196));
         HGDIOBJ op = SelectObject(dc, p);
         Polyline(dc, mp.data(), N + 1);
         SelectObject(dc, op);
         DeleteObject(p);
         for (int i = 0; i < RC.n; i++)
-            if (M.here[i]) circle(dc, (int)(mx + 1 + RC.c[i].x * ms), (int)(my + 3 + RC.c[i].y * ms), i == view ? 5 : 3, mCol(i), RGB(255, 255, 255), 1);
+            if (M.here[i]) circle(dc, (int)(mx + 1 + RC.c[i].x * ms), (int)(my + 3 + RC.c[i].y * ms), i == view ? 4 : 3, mCol(i), i == view ? COL_TEXT : RGB(255, 255, 255), 1);
     }
     if (now < RC.t0) {
         int left = (int)((RC.t0 - now) / 1000) + 1;
@@ -1782,6 +1938,28 @@ static struct PbState {
     float z[PB_COLS];
 } PB;
 
+// 마우스 조준: 게임 화면을 클릭하면 커서를 숨기고 화면 가운데에 붙잡아 둔 채, 움직인 만큼 시점을 돌린다. Esc로 풀림
+static bool g_mouseLook = false;
+static POINT pbCenter() {
+    POINT p{PX(CX + CW / 2), PY(CY + CH / 2)};
+    ClientToScreen(g_hwnd, &p);
+    return p;
+}
+static void pbMouse(bool on) {
+    if (on == g_mouseLook) return;
+    g_mouseLook = on;
+    ShowCursor(on ? FALSE : TRUE);
+    if (on) {
+        POINT a{PX(CX), PY(CY)}, b{PX(CX + CW), PY(CY + CH)}, c = pbCenter();
+        ClientToScreen(g_hwnd, &a);
+        ClientToScreen(g_hwnd, &b);
+        RECT r{a.x, a.y, b.x, b.y};
+        ClipCursor(&r);
+        SetCursorPos(c.x, c.y);
+    } else {
+        ClipCursor(nullptr);
+    }
+}
 static bool pbWall(int x, int y) { return x < 0 || y < 0 || x >= PB_W || y >= PB_H || PB_MAP[y][x] != '.'; }
 static bool pbFree(float x, float y) {
     const float r = 0.22f;
@@ -1879,6 +2057,13 @@ static void pbTick(double dtd) {
             PB.safeUntil = now + 1500;
         }
         bool in = now >= PB.t0 && !PB.over && !m.dead && gameInput();
+        if (g_mouseLook) {   // 마우스가 움직인 만큼 돌고, 커서는 다시 가운데로
+            POINT c = pbCenter(), p;
+            if (GetCursorPos(&p) && (p.x != c.x || p.y != c.y)) {
+                if (in) m.a += (p.x - c.x) * 0.0026f;
+                SetCursorPos(c.x, c.y);
+            }
+        }
         if (in) {
             float turn = (keyDown(VK_RIGHT) || keyDown('E') ? 1.f : 0.f) - (keyDown(VK_LEFT) || keyDown('Q') ? 1.f : 0.f);
             m.a += turn * 2.6f * dt;
@@ -1888,7 +2073,7 @@ static void pbTick(double dtd) {
             float nx = m.x + (c * fwd - s * str) * sp, ny = m.y + (s * fwd + c * str) * sp;
             if (pbFree(nx, m.y)) m.x = nx;
             if (pbFree(m.x, ny)) m.y = ny;
-            if (PB.qShoot || keyDown(VK_SPACE) || keyDown('J')) pbShoot();
+            if (PB.qShoot || keyDown(VK_SPACE) || keyDown('J') || (g_mouseLook && keyDown(VK_LBUTTON))) pbShoot();
         }
         PB.qShoot = false;
         PB.sendAcc += dtd;
@@ -2080,8 +2265,8 @@ static void pbDraw(HDC dc) {
         text(dc, 2, 122, CW, 100, left > 3 ? L"준비" : I(left), 80, RGB(30, 36, 50), true);
         text(dc, 0, 120, CW, 100, left > 3 ? L"준비" : I(left), 80, RGB(255, 255, 255), true);
         roundRect(dc, 80, 300, 480, 60, RGB(255, 255, 255), COL_LINE, 18, 2);
-        text(dc, 80, 304, 480, 26, L"W/S 앞뒤   A/D 옆걸음   ←/→ 또는 Q/E 돌기   Space·J·클릭 발사", 14, COL_TEXT, true);
-        text(dc, 80, 330, 480, 24, L"세 번 맞으면 아웃 · 아웃되면 잠시 뒤 다른 곳에서 다시 시작", 13, COL_SUB);
+        text(dc, 80, 304, 480, 26, L"화면 클릭 → 마우스로 조준 · 클릭 발사   W/A/S/D 이동   Esc 마우스 풀기", 14, COL_TEXT, true);
+        text(dc, 80, 330, 480, 24, L"키보드만으로도 가능: ←/→ 돌기, Space 발사 · 세 번 맞으면 아웃", 13, COL_SUB);
     }
     if (PB.over) {
         bool w = PB.winner == PB.me;
@@ -2091,6 +2276,9 @@ static void pbDraw(HDC dc) {
         resultBox(dc, 190, 150, 260, 70, L"아웃! 곧 다시 시작", COL_OP, 22);
     } else if (GetFocus() == hInput) {
         text(dc, 0, 96, CW, 24, L"⌨ 채팅창에 입력 중 — 조작하려면 게임 화면을 클릭하세요 (Esc)", 14, RGB(255, 255, 255), true);
+    } else if (!g_mouseLook && now >= PB.t0) {
+        text(dc, 1, 97, CW, 24, L"화면을 클릭하면 마우스로 조준합니다 (Esc로 풀기)", 14, RGB(30, 36, 50), true);
+        text(dc, 0, 96, CW, 24, L"화면을 클릭하면 마우스로 조준합니다 (Esc로 풀기)", 14, RGB(255, 255, 255), true);
     }
 }
 
@@ -2361,7 +2549,7 @@ static void grpsPick(int c) {
 }
 
 // ═════════════════════════ 대결: 게임별 연결 ═════════════════════════
-static void gameStop() { O.on = false; Y.on = false; F.on = false; RC.on = false; PB.on = false; }
+static void gameStop() { O.on = false; Y.on = false; F.on = false; RC.on = false; PB.on = false; pbMouse(false); }
 static void gameLeft(int idx) {
     switch (M.view) {
         case V_OMOK: omLeft(idx); break;
@@ -2416,7 +2604,12 @@ static void gameClick(int x, int y) {
     switch (M.view) {
         case V_OMOK: omClick(x, y); break;
         case V_YUT: yutClick(x, y); break;
-        case V_FPS: if (PB.on && !PB.over) PB.qShoot = true; break;
+        case V_FPS:
+            if (PB.on && !PB.over) {
+                pbMouse(true);   // 첫 클릭은 마우스 조준 시작
+                PB.qShoot = true;
+            }
+            break;
     }
 }
 static std::string joinCsv(const std::vector<std::string>& v) {
@@ -2648,10 +2841,11 @@ static void chatFrom(const std::string& pid, const std::wstring& msg) {   // 이
     logAppend(msg, RGB(36, 44, 70), false);
     logEnd();
 }
-static void setProfile(const std::string& pid, int color, int hat) {
+static void setProfile(const std::string& pid, int color, int hat, int piece) {
     if (GPlayer* p = findP(pid)) {
         p->color = color & 7;
         p->hat = (hat % HAT_COUNT + HAT_COUNT) % HAT_COUNT;
+        p->piece = (piece % PIECE_COUNT + PIECE_COUNT) % PIECE_COUNT;
     }
 }
 
@@ -2723,7 +2917,7 @@ static void handleLine(const std::string& line) {
         }
         if (type == "GRPS") { GR.picks[from] = std::max(0, std::min(2, fi(0))); grpsCheck(); return; }
         if (type == "PROF") {
-            setProfile(from, fi(0), fi(1));
+            setProfile(from, fi(0), fi(1), fi(2));
             if (g_isHost) grpSendRoster();
             return;
         }
@@ -2744,6 +2938,7 @@ static void handleLine(const std::string& line) {
             if (np.name.size() > 12) np.name.resize(12);
             np.color = fi(1) & 7;
             np.hat = (fi(2) % HAT_COUNT + HAT_COUNT) % HAT_COUNT;
+            np.piece = (fi(3) % PIECE_COUNT + PIECE_COUNT) % PIECE_COUNT;
             GP.push_back(np);
             grpSendRoster();
             groupSys(np.name + L" 님이 들어왔습니다." + (K.on ? L" (끝말잇기는 다음 판부터)" : L""));
@@ -3077,16 +3272,17 @@ static void roomClick(int x, int y) {
 
 // ═════════════════════════ 꾸미기 ═════════════════════════
 static bool g_custom = false;
-static const Btn custClose{250, 402, 140, 42};
-static Btn custColorBtn(int i) { return {60 + i * 44, 104, 38, 38}; }
-static Btn custHatBtn(int i) { return {60 + i * 58, 190, 52, 62}; }
-static Btn custThemeBtn(int i) { return {60 + i * 90, 300, 82, 78}; }
+static const Btn custClose{250, 408, 140, 38};
+static Btn custColorBtn(int i) { return {60 + i * 44, 88, 38, 38}; }
+static Btn custHatBtn(int i) { return {60 + i * 58, 152, 52, 60}; }
+static Btn custPieceBtn(int i) { return {60 + i * 58, 238, 52, 46}; }
+static Btn custThemeBtn(int i) { return {60 + i * 90, 310, 82, 70}; }
 static void profileChanged() {
     saveCfg();
     if (g_connected && !g_ended) {
-        setProfile(g_pid, g_myColor, g_myHat);
+        setProfile(g_pid, g_myColor, g_myHat, g_myPiece);
         if (g_isHost) grpSendRoster();
-        else sendMsg("PROF", std::to_string(g_myColor) + "|" + std::to_string(g_myHat));
+        else sendMsg("PROF", std::to_string(g_myColor) + "|" + std::to_string(g_myHat) + "|" + std::to_string(g_myPiece));
     }
 }
 static void setCustom(bool on) {
@@ -3098,51 +3294,59 @@ static void drawCustom(HDC dc) {
     COLORREF my = PCOL[g_myColor];
     roundRect(dc, 30, 26, 580, 434, RGB(206, 226, 244), RGB(206, 226, 244), 32, 1);
     roundRect(dc, 30, 20, 580, 434, RGB(255, 255, 255), COL_LINE, 32, 2);
-    text(dc, 60, 32, 110, 36, L"꾸미기", 24, COL_TEXT, true, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    text(dc, 150, 38, 440, 26, L"색과 장식은 친구들 화면에도 보여요 · 판 테마는 내 화면에만 적용돼요", 12, COL_SUB, false, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    text(dc, 60, 28, 110, 34, L"꾸미기", 24, COL_TEXT, true, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    text(dc, 150, 33, 440, 26, L"색 · 장식 · 말은 친구들 화면에도 보여요 · 판 테마는 내 화면에만 적용돼요", 12, COL_SUB, false, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    text(dc, 60, 78, 360, 22, L"내 색  (돌 · 말 · 캐릭터 · 자동차 · 채팅 이름)", 13, COL_SUB, true, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    text(dc, 60, 66, 360, 20, L"내 색  (돌 · 말 · 캐릭터 · 자동차 · 채팅 이름)", 13, COL_SUB, true, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     for (int i = 0; i < 8; i++) {
         Btn b = custColorBtn(i);
-        if (i == g_myColor) ring(dc, b.x + 19, b.y + 19, 21, COL_TEXT, 3);
-        circle(dc, b.x + 19, b.y + 19, 15, PCOL[i], darker(PCOL[i], 0.7), 2);
+        if (i == g_myColor) ring(dc, b.x + 19, b.y + 19, 20, COL_TEXT, 3);
+        circle(dc, b.x + 19, b.y + 19, 14, PCOL[i], darker(PCOL[i], 0.7), 2);
     }
-    text(dc, 60, 162, 360, 22, L"머리 장식", 13, COL_SUB, true, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    text(dc, 60, 130, 360, 20, L"머리 장식  (격투 · 페인트볼 캐릭터)", 13, COL_SUB, true, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     for (int i = 0; i < HAT_COUNT; i++) {
         Btn b = custHatBtn(i);
         bool sel = i == g_myHat;
         roundRect(dc, b.x, b.y, b.w, b.h, sel ? mix(my, RGB(255, 255, 255), 0.86) : RGB(255, 255, 255), sel ? my : COL_LINE, 14, sel ? 3 : 2);
-        drawHead(dc, b.x + 26, b.y + 32, 11, my, i);
-        text(dc, b.x - 4, b.y + 44, b.w + 8, 16, HAT_N[i], 10, COL_SUB, sel);
+        drawHead(dc, b.x + 26, b.y + 31, 11, my, i);
+        text(dc, b.x - 4, b.y + 43, b.w + 8, 15, HAT_N[i], 10, COL_SUB, sel);
     }
-    text(dc, 60, 272, 360, 22, L"게임 판 테마  (오목 · 윷놀이 · 레이싱)", 13, COL_SUB, true, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    text(dc, 60, 216, 360, 20, L"윷놀이 말 모양", 13, COL_SUB, true, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    for (int i = 0; i < PIECE_COUNT; i++) {
+        Btn b = custPieceBtn(i);
+        bool sel = i == g_myPiece;
+        roundRect(dc, b.x, b.y, b.w, b.h, sel ? mix(my, RGB(255, 255, 255), 0.86) : RGB(255, 255, 255), sel ? my : COL_LINE, 14, sel ? 3 : 2);
+        drawPiece(dc, b.x + 26, b.y + (i == 5 ? 20 : 17), 10, i, my, g_myHat);
+        text(dc, b.x - 4, b.y + 30, b.w + 8, 14, PIECE_N[i], 10, COL_SUB, sel);
+    }
+    text(dc, 60, 288, 360, 20, L"게임 판 테마  (오목 · 윷놀이 · 레이싱)", 13, COL_SUB, true, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     for (int i = 0; i < THEME_COUNT; i++) {
         Btn b = custThemeBtn(i);
         const Theme& T = THEMES[i];
         bool sel = i == g_theme;
-        if (sel) roundRect(dc, b.x - 5, b.y - 5, b.w + 10, 64, RGB(255, 255, 255), COL_TEXT, 16, 3);
-        roundRect(dc, b.x, b.y, b.w, 54, T.board, T.edge, 12, 3);
-        for (int k = 1; k <= 3; k++) line(dc, b.x + k * 20, b.y + 8, b.x + k * 20, b.y + 46, T.line, 1);
-        for (int k = 1; k <= 2; k++) line(dc, b.x + 8, b.y + k * 18, b.x + b.w - 8, b.y + k * 18, T.line, 1);
-        circle(dc, b.x + 40, b.y + 18, 7, my, darker(my, 0.6), 2);
-        circle(dc, b.x + 60, b.y + 36, 7, T.node, T.line, 2);
-        text(dc, b.x, b.y + 58, b.w, 20, T.name, 13, COL_TEXT, sel);
+        if (sel) roundRect(dc, b.x - 5, b.y - 5, b.w + 10, 58, RGB(255, 255, 255), COL_TEXT, 16, 3);
+        roundRect(dc, b.x, b.y, b.w, 48, T.board, T.edge, 12, 3);
+        for (int k = 1; k <= 3; k++) line(dc, b.x + k * 20, b.y + 7, b.x + k * 20, b.y + 41, T.line, 1);
+        for (int k = 1; k <= 2; k++) line(dc, b.x + 8, b.y + k * 16, b.x + b.w - 8, b.y + k * 16, T.line, 1);
+        circle(dc, b.x + 40, b.y + 16, 6, my, darker(my, 0.6), 2);
+        circle(dc, b.x + 60, b.y + 32, 6, T.node, T.line, 2);
+        text(dc, b.x, b.y + 52, b.w, 18, T.name, 13, COL_TEXT, sel);
     }
     // 미리보기
-    roundRect(dc, 442, 78, 150, 306, COL_BG, COL_LINE, 20, 2);
-    text(dc, 442, 84, 150, 22, L"미리보기", 12, COL_SUB, true);
+    roundRect(dc, 442, 66, 150, 322, COL_BG, COL_LINE, 20, 2);
+    text(dc, 442, 72, 150, 22, L"미리보기", 12, COL_SUB, true);
     Fighter pf;
     pf.x = 517;
-    pf.y = 268;
+    pf.y = 262;
     drawFighter(dc, pf, my, g_myHat, L"", false);
-    text(dc, 442, 274, 150, 20, g_myName.empty() ? getText(hName) : g_myName, 14, darker(my, 0.75), true, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    text(dc, 442, 268, 150, 20, g_myName.empty() ? getText(hName) : g_myName, 14, darker(my, 0.75), true, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     const Theme& T = THEMES[g_theme];
-    roundRect(dc, 456, 304, 122, 66, T.board, T.edge, 12, 3);
-    line(dc, 466, 337, 568, 337, T.line, 2);
-    circle(dc, 486, 337, 11, T.node, T.line, 2);
-    circle(dc, 486, 337, 8, my, darker(my, 0.65), 2);
-    raceCar(dc, 540, 337, -0.35f, my, false, L"");
-    button(dc, custClose, L"닫기", true, COL_MAIN, 17);
+    roundRect(dc, 456, 300, 122, 72, T.board, T.edge, 12, 3);
+    line(dc, 466, 338, 568, 338, T.line, 2);
+    circle(dc, 488, 338, 13, T.node, T.line, 2);
+    drawPiece(dc, 488, 338, 11, g_myPiece, my, g_myHat);
+    raceCar(dc, 542, 338, -0.35f, my, false, L"");
+    button(dc, custClose, L"닫기", true, COL_MAIN, 16);
 }
 static void customClick(int x, int y) {
     if (custClose.hit(x, y) || x < 30 || x > 610 || y < 20 || y > 454) { setCustom(false); return; }
@@ -3150,6 +3354,8 @@ static void customClick(int x, int y) {
         if (custColorBtn(i).hit(x, y)) { g_myColor = i; profileChanged(); }
     for (int i = 0; i < HAT_COUNT; i++)
         if (custHatBtn(i).hit(x, y)) { g_myHat = i; profileChanged(); }
+    for (int i = 0; i < PIECE_COUNT; i++)
+        if (custPieceBtn(i).hit(x, y)) { g_myPiece = i; profileChanged(); }
     for (int i = 0; i < THEME_COUNT; i++)
         if (custThemeBtn(i).hit(x, y)) { g_theme = i; saveCfg(); }
     invalidateCanvas();
@@ -3269,7 +3475,7 @@ static void copyToClipboard(const std::wstring& s) {
     CloseClipboard();
 }
 static void sendJoinReq() {
-    sendMsg("JOIN_REQ", U8(g_myName) + "|" + std::to_string(g_myColor) + "|" + std::to_string(g_myHat));
+    sendMsg("JOIN_REQ", U8(g_myName) + "|" + std::to_string(g_myColor) + "|" + std::to_string(g_myHat) + "|" + std::to_string(g_myPiece));
 }
 // 방 만들기 (방 코드): 중계 서버에 접속해서 방 주소를 연다
 static void startGroupHost() {
@@ -3351,6 +3557,7 @@ static void becomeHost() {   // 나 혼자 있는 방으로 시작
     me.name = g_myName;
     me.color = g_myColor;
     me.hat = g_myHat;
+    me.piece = g_myPiece;
     GP = {me};
     g_hostPid = g_pid;
     onConnected();
@@ -3931,6 +4138,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     resendTick();
                     rxTick();
                 }
+                // 마우스 조준은 페인트볼을 직접 조작하는 동안에만 (채팅 · 다른 탭 · 다른 창 · 게임 끝이면 풀림)
+                if (g_mouseLook && (!g_connected || g_ended || !M.on || M.view != V_FPS || g_view != V_FPS || !PB.on || PB.over || g_custom || !gameInput()))
+                    pbMouse(false);
                 if (g_connected && !g_ended) {
                     gameTick(dt);
                     roomTick();
@@ -3966,7 +4176,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             if (M.on && PB.on && (wp == VK_SPACE || wp == 'J')) PB.qShoot = true;   // 페인트볼: 짧게 눌러도 발사
             if (wp == VK_RETURN && g_connected) SetFocus(hInput);
-            if (wp == VK_ESCAPE && g_custom) setCustom(false);
+            if (wp == VK_ESCAPE && g_mouseLook) pbMouse(false);
+            else if (wp == VK_ESCAPE && g_custom) setCustom(false);
             else if (wp == VK_ESCAPE && g_full) setFullscreen(false);
             return 0;
         case WM_ERASEBKGND:
@@ -3998,6 +4209,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_CLOSE:
+            pbMouse(false);
             sayBye();
             saveCfg();
             g_gen++;
