@@ -28,6 +28,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <thread>
 #include <vector>
@@ -59,7 +60,7 @@ static const Broker BROKERS[] = {{"broker.hivemq.com", 1883}, {"test.mosquitto.o
 static const int SLOW_BROKER = 2;
 static const int NBROKER = 3;
 static const char* CODE_ABC = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-static const std::string TOPIC_BASE = "mgparty-rhkwptq/v3/";
+static const std::string TOPIC_BASE = "mgparty-rhkwptq/v4/";
 
 const int CX = 10, CY = 50, CW = 640, CH = 480;      // 게임 화면(논리 좌표)
 static int g_btnW = 88, g_btnStep = 92;              // 탭 버튼 크기
@@ -504,6 +505,20 @@ static COLORREF mix(COLORREF a, COLORREF b, double t) {
 static bool keyDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 // 키보드가 게임에 들어가는 상태인지 (창이 앞에 있고, 채팅 입력 중이 아님)
 static bool gameInput() { return GetForegroundWindow() == g_hwnd && GetFocus() != hInput; }
+// 짧은 움직임(윷 던지기, 말 이동, 돌 놓기 ...)을 보여 주는 동안에는 화면을 매 프레임 다시 그린다.
+// 움직임은 보는 사람 화면에서만 재생되고, 게임 상태는 받은 즉시 바뀐다 (주고받는 내용은 그대로).
+static ULONGLONG g_animUntil = 0;
+static void animFor(int ms) {
+    g_animUntil = std::max(g_animUntil, GetTickCount64() + (ULONGLONG)ms);
+    invalidateCanvas();
+}
+static double animT(ULONGLONG t0, int ms) {   // t0에 시작해 ms 동안 0 → 1
+    ULONGLONG now = GetTickCount64();
+    if (now <= t0) return 0;
+    return std::min(1.0, (double)(now - t0) / ms);
+}
+static double easeOut(double t) { return 1 - (1 - t) * (1 - t) * (1 - t); }
+static const double PI = 3.14159265358979;
 
 // ═════════════════════════ 설정 저장 (닉네임 · 색 · 장식 · 판 테마) ═════════════════════════
 static std::wstring g_savedName;
@@ -767,6 +782,7 @@ static struct OmokState {
     int seat[3] = {-1, 0, 1};   // seat[1] = 선공 자리, seat[2] = 후공 자리
     char my = 0, turn = 1;
     int moves = 0, last = -1;
+    ULONGLONG placedAt = 0;     // 마지막 돌을 놓은 시각 (떨어지는 모습용)
     std::wstring result;
     COLORREF rc = 0;
 } O;
@@ -813,6 +829,8 @@ static void omPlace(int p, char c) {
     O.b[p] = c;
     O.moves++;
     O.last = p;
+    O.placedAt = GetTickCount64();
+    animFor(450);
     O.turn = (char)(3 - c);
     if (omFive(p)) omEnd(c, L"");
     else if (O.moves == OM_N * OM_N) omEnd(0, L"");
@@ -877,8 +895,17 @@ static void omDraw(HDC dc) {
     for (int p = 0; p < OM_N * OM_N; p++) {
         if (!O.b[p]) continue;
         int cx = OM_X + (p % OM_N) * OM_S, cy = OM_Y + (p / OM_N) * OM_S;
-        omStone(dc, cx, cy, 12, O.b[p]);
-        if (p == O.last) ring(dc, cx, cy, 15, COL_ACC, 3);
+        if (p != O.last) { omStone(dc, cx, cy, 12, O.b[p]); continue; }
+        // 방금 놓은 돌: 위에서 떨어져 한 번 튀고, 물결이 퍼진다
+        double t = animT(O.placedAt, 400);
+        double fall = t < 0.55 ? 1 - t / 0.55 : 0;                            // 1 → 0 (떨어지는 중)
+        double hop = t >= 0.55 ? std::sin((t - 0.55) / 0.45 * PI) * 0.18 : 0;   // 살짝 튐
+        int lift = (int)std::lround(fall * fall * 46 + hop * 20);
+        int r = 12 + (int)std::lround(fall * 7);
+        if (lift > 0) circle(dc, cx + 2, cy + 3, 11 - (int)(fall * 4), mix(T.board, RGB(0, 0, 0), 0.22), mix(T.board, RGB(0, 0, 0), 0.22), 1);
+        if (t >= 0.55 && t < 1) ring(dc, cx, cy, 15 + (int)((t - 0.55) / 0.45 * 16), mix(COL_ACC, T.board, (t - 0.55) / 0.45), 3);
+        omStone(dc, cx, cy - lift, r, O.b[p]);
+        if (t >= 1) ring(dc, cx, cy, 15, COL_ACC, 3);
     }
     // 오른쪽 패널
     for (int s = 1; s <= 2; s++) {
@@ -913,7 +940,28 @@ static struct YutState {
     int sel = -1, last = 0;
     int sticks[4] = {0, 0, 0, 0};   // 1 = 배(평평한 면)
     std::wstring note;
+    // ── 움직임 (보여 주기용. 게임 상태는 위 값들이 이미 최종 결과다) ──
+    ULONGLONG throwAt = 0;            // 윷을 던진 시각. 날아가는 동안 결과를 숨긴다
+    std::wstring lateLog;             // 윷이 떨어진 뒤에 채팅창에 적을 말
+    int hopSeat = -1, hopCount = 0, hopDest = 0;   // 한 칸씩 뛰어가는 말
+    std::vector<POINT> hopPath;
+    ULONGLONG hopAt = 0;
+    struct Back { int seat, count; POINT from; };
+    std::vector<Back> back;           // 잡혀서 대기 자리로 돌아가는 말
 } Y;
+static const int YUT_FLY_MS = 1150, YUT_POP_MS = 750, YUT_HOP_MS = 270, YUT_BACK_MS = 480;
+static bool yutFlying() { return Y.throwAt && GetTickCount64() < Y.throwAt + YUT_FLY_MS; }
+static ULONGLONG yutHopEnd() { return Y.hopAt + (ULONGLONG)(std::max<size_t>(1, Y.hopPath.size()) - 1) * YUT_HOP_MS; }
+static bool yutHopping() { return Y.hopSeat >= 0 && GetTickCount64() < yutHopEnd(); }
+static bool yutBusy() { return yutFlying() || yutHopping(); }
+static void yutFlushLog() {
+    if (!Y.lateLog.empty()) gmsg(Y.lateLog);
+    Y.lateLog.clear();
+}
+static void yutTick() {
+    if (!yutFlying()) yutFlushLog();
+    if (Y.on && Y.turn == mMe() && Y.throwsLeft == 0) animFor(200);   // 움직일 수 있는 내 말의 고리가 계속 숨쉬도록
+}
 static const Btn yutMainBtn{400, 222, 225, 48}, yutHomeBtn{400, 380, 225, 40};
 static Btn yutChip(int i) { return {400 + (i % 4) * 57, 305 + (i / 4) * 36, 52, 32}; }
 
@@ -991,9 +1039,11 @@ static void yutApplyThrow(int res, const std::string& st) {
     } else {
         Y.note = who + L": " + YUT_N[res];
     }
-    gmsg(L"윷놀이 " + Y.note);
+    yutFlushLog();
+    Y.lateLog = L"윷놀이 " + Y.note;   // 결과는 윷이 떨어진 뒤에 적는다 (yutTick)
+    Y.throwAt = GetTickCount64();
+    animFor(YUT_FLY_MS + YUT_POP_MS + 50);
     Y.sel = -1;
-    invalidateCanvas();
 }
 static void yutApplyMove(int piece, int pi) {
     if (pi < 0 || pi >= (int)Y.pending.size() || piece < 0 || piece >= Y.np) return;
@@ -1003,6 +1053,16 @@ static void yutApplyMove(int piece, int pi) {
     int steps = Y.pending[pi];
     Y.pending.erase(Y.pending.begin() + pi);
     int dest = yutWalk(start, steps);
+    yutFlushLog();
+    // 지나갈 칸을 차례로 모아 둔다 (한 칸씩 뛰어가는 모습용)
+    Y.hopPath.clear();
+    Y.hopPath.push_back(yutXY(start == HOME ? 0 : start));
+    for (int i = 1; i <= steps; i++) {
+        int p = yutWalk(start, i);
+        Y.hopPath.push_back(yutXY(p == DONE ? 0 : p));
+        if (p == DONE) break;
+    }
+    Y.back.clear();
     int moved = 0;
     for (int k = 0; k < Y.np; k++) {
         if ((start == HOME && k == piece) || (start != HOME && Y.pos[seat][k] == start)) {
@@ -1018,10 +1078,13 @@ static void yutApplyMove(int piece, int pi) {
         std::wstring whom;
         for (int s = 0; s < Y.n; s++) {
             if (s == seat) continue;
-            bool any = false;
+            int mine = 0;
             for (int k = 0; k < Y.np; k++)
-                if (Y.pos[s][k] == dest) { Y.pos[s][k] = HOME; caught++; any = true; }
-            if (any) whom += (whom.empty() ? L"" : L", ") + mName(s);
+                if (Y.pos[s][k] == dest) { Y.pos[s][k] = HOME; caught++; mine++; }
+            if (mine) {
+                whom += (whom.empty() ? L"" : L", ") + mName(s);
+                Y.back.push_back({s, mine, yutXY(dest)});
+            }
         }
         if (caught) {
             Y.throwsLeft++;
@@ -1030,6 +1093,11 @@ static void yutApplyMove(int piece, int pi) {
     }
     Y.note = msg;
     gmsg(L"윷놀이 " + msg);
+    Y.hopSeat = seat;
+    Y.hopCount = moved;
+    Y.hopDest = dest;
+    Y.hopAt = GetTickCount64();
+    animFor((int)(Y.hopPath.size() - 1) * YUT_HOP_MS + YUT_BACK_MS + 80);
     bool all = true;
     for (int k = 0; k < Y.np; k++) all = all && Y.pos[seat][k] == DONE;
     if (all) {
@@ -1050,6 +1118,8 @@ static void yutMsg(int idx, const std::string& type, const std::vector<std::stri
 static void yutLeft(int idx) {
     if (idx < 0 || idx >= 4) return;
     for (int& p : Y.pos[idx]) p = HOME;
+    if (Y.hopSeat == idx) Y.hopSeat = -1;
+    Y.back.clear();
     if (Y.on && Y.turn == idx) yutNextTurn();
 }
 static void yutThrow() {
@@ -1076,7 +1146,7 @@ static void yutMove(int piece) {
 }
 static void yutClick(int x, int y) {
     int me = mMe();
-    if (!Y.on || me < 0 || Y.turn != me) return;
+    if (!Y.on || me < 0 || Y.turn != me || yutBusy()) return;   // 윷이 날거나 말이 뛰는 동안에는 기다린다
     if (Y.throwsLeft > 0) {
         if (yutMainBtn.hit(x, y)) yutThrow();
         return;
@@ -1107,6 +1177,25 @@ static void drawStick(HDC dc, int x, int y, bool flat) {
         roundRect(dc, x, y, 34, 86, RGB(160, 100, 50), RGB(110, 65, 30), 16, 2);
     }
 }
+// 공중에서 도는 윷가락: tilt = 기울기, spin = 긴 축을 중심으로 돈 각도 (cos > 0 이면 배가 보임)
+static void drawStickFly(HDC dc, double cx, double cy, double tilt, double spin, double scale) {
+    double c = std::cos(spin), L = 26 * scale;
+    bool flat = c > 0;
+    int w = std::max(7, (int)std::lround(34 * scale * std::fabs(c)));
+    double ax = std::sin(tilt), ay = -std::cos(tilt);
+    int x1 = (int)std::lround(cx - ax * L), y1 = (int)std::lround(cy - ay * L);
+    int x2 = (int)std::lround(cx + ax * L), y2 = (int)std::lround(cy + ay * L);
+    line(dc, x1, y1, x2, y2, flat ? RGB(160, 110, 60) : RGB(110, 65, 30), w + 4);
+    line(dc, x1, y1, x2, y2, flat ? RGB(252, 238, 205) : RGB(160, 100, 50), w);
+    if (flat && w >= 16) {   // 배에 그려진 X 표시
+        int m = w / 5;
+        for (int i = -1; i <= 1; i++) {
+            int mx = (int)std::lround(cx + ax * L * 0.62 * i), my = (int)std::lround(cy + ay * L * 0.62 * i);
+            line(dc, mx - m, my - m, mx + m, my + m, RGB(120, 70, 30), 2);
+            line(dc, mx + m, my - m, mx - m, my + m, RGB(120, 70, 30), 2);
+        }
+    }
+}
 static void yutDraw(HDC dc) {
     const Theme& T = THEMES[g_theme];
     int me = mMe();
@@ -1135,36 +1224,76 @@ static void yutDraw(HDC dc) {
     text(dc, BR.x - 120, BR.y + 5, 96, 18, L"출발 · 도착 ▶", 12, T.line, true, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
 
     // 말 (각자 고른 색)
+    bool flying = yutFlying(), hopping = yutHopping();
+    int colW = Y.n <= 2 ? 300 : Y.n == 3 ? 200 : 152;   // 아래쪽 사람별 칸 너비
+    auto pieceAt = [&](int s, int x, int y, int count, int r) {
+        COLORREF c = mCol(s);
+        drawPiece(dc, x, y, r, mPiece(s), c, mHat(s));
+        if (count > 1) {   // 업은 말 수
+            circle(dc, x + 12, y - 11, 8, RGB(255, 255, 255), darker(c, 0.6), 2);
+            text(dc, x + 4, y - 19, 16, 16, I(count), 11, COL_TEXT, true);
+        }
+    };
     for (int s = 0; s < Y.n; s++) {
         if (!M.here[s]) continue;
-        COLORREF c = mCol(s);
         std::map<int, int> cnt;
         for (int k = 0; k < Y.np; k++)
             if (Y.pos[s][k] >= 0 && Y.pos[s][k] <= 28) cnt[Y.pos[s][k]]++;
+        if (hopping && s == Y.hopSeat && cnt.count(Y.hopDest)) cnt[Y.hopDest] -= Y.hopCount;   // 아직 뛰어가는 중인 말은 따로 그린다
         for (auto& kv : cnt) {
+            if (kv.second <= 0) continue;
             POINT pt = yutXY(kv.first);
-            if (s == me && myTurn && Y.throwsLeft == 0) ring(dc, pt.x, pt.y, 17, COL_ACC, 4);
-            drawPiece(dc, pt.x, pt.y, 14, mPiece(s), c, mHat(s));
-            if (kv.second > 1) {   // 업은 말 수
-                circle(dc, pt.x + 12, pt.y - 11, 8, RGB(255, 255, 255), darker(c, 0.6), 2);
-                text(dc, pt.x + 4, pt.y - 19, 16, 16, I(kv.second), 11, COL_TEXT, true);
+            if (s == me && myTurn && Y.throwsLeft == 0 && !yutBusy()) {   // 움직일 수 있는 내 말: 고리가 숨쉬듯 커졌다 작아진다
+                int pr = 17 + (int)std::lround(std::sin(GetTickCount64() / 160.0) * 2);
+                ring(dc, pt.x, pt.y, pr, COL_ACC, 4);
             }
+            pieceAt(s, pt.x, pt.y, kv.second, 14);
         }
+    }
+    // 잡힌 말: 잡는 말이 도착할 때까지 제자리에 있다가, 대기 자리로 날아간다
+    if (Y.hopSeat >= 0) {
+        double bt = animT(yutHopEnd(), YUT_BACK_MS);
+        for (auto& b : Y.back) {
+            if (bt >= 1 || !M.here[b.seat]) continue;
+            double e = easeOut(bt);
+            int tx = 28 + b.seat * colW + 10, ty = 447;
+            int x = (int)std::lround(b.from.x + (tx - b.from.x) * e);
+            int y = (int)std::lround(b.from.y + (ty - b.from.y) * e - std::sin(bt * PI) * 60);
+            pieceAt(b.seat, x, y, b.count, 14 - (int)(e * 5));
+        }
+    }
+    // 뛰어가는 말: 한 칸에 한 번씩 통통 뛴다
+    if (hopping && M.here[Y.hopSeat]) {
+        double q = (double)(GetTickCount64() - Y.hopAt) / YUT_HOP_MS;
+        int i = std::min((int)q, (int)Y.hopPath.size() - 2);
+        double f = q - i;
+        POINT a = Y.hopPath[i], b = Y.hopPath[i + 1];
+        int x = (int)std::lround(a.x + (b.x - a.x) * f);
+        int gy = (int)std::lround(a.y + (b.y - a.y) * f);
+        int up = (int)std::lround(std::sin(f * PI) * 20);
+        circle(dc, x, gy + 9, 9 - up / 5, mix(T.board, RGB(0, 0, 0), 0.2), mix(T.board, RGB(0, 0, 0), 0.2), 1);   // 그림자
+        pieceAt(Y.hopSeat, x, gy - up, Y.hopCount, 15);
     }
 
     // 오른쪽 패널
     if (Y.on)
         text(dc, 400, 60, 225, 30, myTurn ? L"▶ 내 차례" : L"▶ " + mName(Y.turn) + L" 차례", 20, mCol(Y.turn), true,
              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-    for (int i = 0; i < 4; i++) drawStick(dc, 404 + i * 44, 95, Y.last ? Y.sticks[i] == 1 : (i % 2 == 0));
-    if (Y.last) text(dc, 585, 95, 45, 86, YUT_N[Y.last], 26, COL_TEXT, true);
-    text(dc, 400, 186, 230, 34, Y.note, 13, COL_SUB, false, DT_LEFT | DT_WORDBREAK);
+    if (!flying) {
+        for (int i = 0; i < 4; i++) drawStick(dc, 404 + i * 44, 95, Y.last ? Y.sticks[i] == 1 : (i % 2 == 0));
+        if (Y.last) text(dc, 585, 95, 45, 86, YUT_N[Y.last], 26, COL_TEXT, true);
+        text(dc, 400, 186, 230, 34, Y.note, 13, COL_SUB, false, DT_LEFT | DT_WORDBREAK);
+    } else {
+        for (int i = 0; i < 4; i++) roundRect(dc, 404 + i * 44, 95, 34, 86, RGB(240, 245, 251), COL_LINE, 16, 1);   // 빈 자리
+        text(dc, 400, 186, 230, 34, std::wstring(L"윷이 날아갑니다..."), 13, COL_SUB, false, DT_LEFT | DT_WORDBREAK);
+    }
 
     if (Y.on) {
-        button(dc, yutMainBtn, L"윷 던지기", myTurn && Y.throwsLeft > 0, COL_ME, 20);
+        button(dc, yutMainBtn, L"윷 던지기", myTurn && Y.throwsLeft > 0 && !yutBusy(), COL_ME, 20);
         text(dc, 400, 278, 225, 24, L"남은 이동:", 14, COL_SUB, true, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         int autoSel = Y.sel >= 0 ? Y.sel : (Y.pending.size() == 1 ? 0 : -1);
-        for (int i = 0; i < (int)Y.pending.size() && i < 8; i++) {
+        int shown = (int)Y.pending.size() - (flying ? 1 : 0);   // 날아가는 윷의 결과는 떨어진 뒤에 보인다
+        for (int i = 0; i < shown && i < 8; i++) {
             Btn b = yutChip(i);
             bool sel = i == autoSel && myTurn && Y.throwsLeft == 0;
             roundRect(dc, b.x, b.y, b.w, b.h, sel ? COL_ACC : RGB(255, 255, 255), sel ? darker(COL_ACC) : COL_LINE, 12, 2);
@@ -1173,13 +1302,12 @@ static void yutDraw(HDC dc) {
         int myHome = 0;
         if (me >= 0)
             for (int k = 0; k < Y.np; k++) myHome += Y.pos[me][k] == HOME;
-        button(dc, yutHomeBtn, L"대기 말 " + I(myHome) + L"개  ▶ 새로 출발", myTurn && Y.throwsLeft == 0 && myHome > 0, COL_ME, 15);
+        button(dc, yutHomeBtn, L"대기 말 " + I(myHome) + L"개  ▶ 새로 출발", myTurn && Y.throwsLeft == 0 && myHome > 0 && !yutBusy(), COL_ME, 15);
     } else {
         drawAgain(dc, 420, 300, 180, 46);
     }
 
     // 아래: 사람별 대기 · 완주
-    int colW = Y.n <= 2 ? 300 : Y.n == 3 ? 200 : 152;
     for (int s = 0; s < Y.n; s++) {
         int x = 28 + s * colW, home = 0, done = 0;
         for (int k = 0; k < Y.np; k++) { home += Y.pos[s][k] == HOME; done += Y.pos[s][k] == DONE; }
@@ -1190,7 +1318,34 @@ static void yutDraw(HDC dc) {
         text(dc, x + 24, 455, colW - 30, 20, M.here[s] ? L"대기 " + I(home) + L" · 완주 " + I(done) + L"/" + I(Y.np) : std::wstring(L"나감"), 12,
              COL_SUB, false, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     }
-    if (Y.winner >= 0) {
+    // 던진 윷: 판 위로 빙글빙글 돌며 날아갔다가 오른쪽 자리로 떨어진다. 떨어지면 결과가 크게 튀어나온다
+    if (Y.throwAt) {
+        double t = animT(Y.throwAt, YUT_FLY_MS);
+        if (t < 1) {
+            double e = easeOut(t), arc = std::sin(t * PI);
+            for (int i = 0; i < 4; i++) {
+                double sx = 421 + i * 44, sy = 138;
+                double x = sx - 205 * arc * (1 - t * 0.3) + (i - 1.5) * 16 * arc;
+                double y = sy + (70 + (i % 2) * 46) * arc - 150 * arc * (1 - t);
+                double endSpin = Y.sticks[i] == 1 ? 0 : PI;
+                double spin = endSpin + (1 - e) * (2 * PI * (4 + i) + (i % 2 ? PI : 0));
+                double tilt = (1 - e) * (i % 2 ? -1 : 1) * (4.2 + i * 0.9);
+                drawStickFly(dc, x, y, tilt, spin, 1 + 0.22 * arc);
+            }
+        } else {
+            double p = animT(Y.throwAt + YUT_FLY_MS, YUT_POP_MS);
+            if (p < 1 && Y.last) {
+                double grow = p < 0.25 ? p / 0.25 : 1;                 // 커지며 등장
+                int sz = (int)std::lround(30 + 34 * easeOut(grow) + (p < 0.4 ? std::sin(p / 0.4 * PI) * 8 : 0));
+                COLORREF c = Y.last >= 4 ? COL_ACC : COL_ME;
+                int bw = sz * 3 + 30, bh = sz + 44;
+                roundRect(dc, 205 - bw / 2, 250 - bh / 2, bw, bh, RGB(255, 255, 255), c, 28, 4);
+                text(dc, 205 - bw / 2, 250 - bh / 2 + 4, bw, sz + 12, YUT_N[Y.last], sz, c, true);
+                text(dc, 205 - bw / 2, 250 + bh / 2 - 30, bw, 22, Y.last >= 4 ? L"한 번 더!" : I(Y.last) + L"칸", 15, COL_SUB, true);
+            }
+        }
+    }
+    if (Y.winner >= 0 && !hopping) {
         bool w = Y.winner == me;
         resultBox(dc, 70, 195, 270, 80, w ? L"승리! 🎉" : mName(Y.winner) + L" 승리", w ? COL_WINC : COL_OP, w ? 36 : 24);
     }
@@ -2306,8 +2461,15 @@ static struct {
     int turnMs = 15000;
     std::vector<std::pair<std::wstring, std::wstring>> hist;   // (이름, 단어)
     std::vector<std::wstring> used;
+    bool noKill = false, inj = false;   // 이번 판 규칙: 한방 단어 금지, 어인정(사전에 없는 유명한 말) 허용
+    std::wstring def;                   // 현재 단어의 뜻
+    std::wstring hint;                  // 탈락한 사람이 낼 수 있었던 단어 (뜻 포함)
+    ULONGLONG wordAt = 0;               // 단어가 바뀐 시각 (새 단어가 튀어나오는 모습용)
 } K;
+// 방장이 시작 전에 고르는 규칙 (다음 판에 적용)
+static bool g_kNoKill = true, g_kInj = false;
 static const Btn grpStartBtn{335, 405, 200, 52}, grpCopyBtn{520, 14, 106, 30};
+static const Btn kOptKill{250, 346, 370, 24}, kOptInj{250, 374, 370, 24};
 static const wchar_t* START_WORDS[] = {L"사과", L"기차", L"바다", L"나무", L"하늘", L"고양이", L"컴퓨터", L"학교", L"자동차",
                                        L"축구", L"우산", L"연필", L"사탕", L"토끼", L"가방", L"구름", L"시계", L"바나나",
                                        L"호랑이", L"피아노", L"딸기", L"수박", L"모자", L"거울", L"지구", L"도서관", L"비행기"};
@@ -2339,6 +2501,8 @@ static wchar_t dueum(wchar_t c) {
 }
 // 끝말잇기 사전: exe에 넣은 표준국어대사전 명사 목록 (data/korean_nouns.txt, CC0)
 static std::unordered_set<std::wstring>* g_dict = nullptr;
+// 첫 글자 → 그 글자로 시작하는 단어들 (한방 단어 판정과 예시 단어 찾기에 쓴다)
+static std::unordered_map<wchar_t, std::vector<const std::wstring*>> g_first, g_firstExtra;
 static const std::unordered_set<std::wstring>* dict() {
     static bool tried = false;
     if (tried) return g_dict;
@@ -2356,10 +2520,115 @@ static const std::unordered_set<std::wstring>* dict() {
     while (s < all.size()) {
         size_t e = all.find(L'\n', s);
         if (e == std::wstring::npos) e = all.size();
-        if (e > s) g_dict->insert(all.substr(s, e - s));
-        s = e + 1;
+        if (e > s && all[e - 1] == L'\r') e--;
+        if (e > s) {
+            auto it = g_dict->insert(all.substr(s, e - s)).first;
+            g_first[(*it)[0]].push_back(&*it);   // 집합에 든 문자열의 주소는 바뀌지 않는다
+        }
+        s = all.find(L'\n', s);
+        s = s == std::wstring::npos ? all.size() : s + 1;
     }
     return g_dict;
+}
+// 어인정 단어: 사전에는 없지만 다들 아는 말 (게임, 만화, 상표, 새말 ...). data/extra_words.txt, 한 줄에 "단어<탭>분류"
+static std::unordered_map<std::wstring, std::wstring>* g_extra = nullptr;
+static const std::unordered_map<std::wstring, std::wstring>* extraWords() {
+    static bool tried = false;
+    if (tried) return g_extra;
+    tried = true;
+    HRSRC r = FindResourceW(nullptr, MAKEINTRESOURCEW(3), RT_RCDATA);
+    HGLOBAL h = r ? LoadResource(nullptr, r) : nullptr;
+    DWORD n = r ? SizeofResource(nullptr, r) : 0;
+    const char* p = h ? (const char*)LockResource(h) : nullptr;
+    if (!p || !n) return nullptr;
+    std::wstring all = W(std::string(p, n));
+    g_extra = new std::unordered_map<std::wstring, std::wstring>();
+    size_t s = 0;
+    while (s < all.size()) {
+        size_t e = all.find(L'\n', s);
+        if (e == std::wstring::npos) e = all.size();
+        std::wstring ln = all.substr(s, e - s);
+        s = e + 1;
+        while (!ln.empty() && (ln.back() == L'\r' || ln.back() == L' ')) ln.pop_back();
+        if (ln.empty() || ln[0] == L'#' || ln[0] == 0xFEFF) continue;
+        size_t tab = ln.find(L'\t');
+        std::wstring w = ln.substr(0, tab), cat = tab == std::wstring::npos ? L"" : ln.substr(tab + 1);
+        if (w.size() < 2) continue;
+        auto it = g_extra->emplace(w, cat).first;
+        g_firstExtra[w[0]].push_back(&it->first);
+    }
+    return g_extra;
+}
+// 뜻풀이: data/korean_defs.txt (한 줄에 "단어<탭>뜻", 단어의 UTF-8 바이트 순서로 정렬) 를 exe에 넣어 두고 이분 탐색으로 찾는다.
+// 따로 메모리에 풀어 놓지 않으므로 프로그램이 무거워지지 않는다. 자료 없이 빌드하면 뜻만 안 보인다.
+static std::wstring defOf(const std::wstring& w) {
+    if (extraWords()) {
+        auto it = g_extra->find(w);
+        if (it != g_extra->end() && !(g_dict && g_dict->count(w))) return L"어인정 단어" + (it->second.empty() ? L"" : L" · " + it->second);
+    }
+    static const char* base = nullptr;
+    static size_t size = 0;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        HRSRC r = FindResourceW(nullptr, MAKEINTRESOURCEW(2), RT_RCDATA);
+        HGLOBAL h = r ? LoadResource(nullptr, r) : nullptr;
+        base = h ? (const char*)LockResource(h) : nullptr;
+        size = base ? SizeofResource(nullptr, r) : 0;
+    }
+    if (!base || !size) return L"";
+    std::string key = U8(w);
+    size_t lo = 0, hi = size;   // [lo, hi) 안에서 줄 시작 위치를 찾는다
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2, ls = mid;
+        while (ls > lo && base[ls - 1] != '\n') ls--;   // mid가 속한 줄의 시작
+        size_t le = ls;
+        while (le < size && base[le] != '\n') le++;
+        size_t tab = ls;
+        while (tab < le && base[tab] != '\t') tab++;
+        int c = std::string(base + ls, tab - ls).compare(key);
+        if (c == 0) {
+            size_t ds = std::min(le, tab + 1), de = le;
+            if (de > ds && base[de - 1] == '\r') de--;
+            return W(std::string(base + ds, de - ds));
+        }
+        if (c < 0) lo = le + 1;
+        else hi = ls;
+    }
+    return L"";
+}
+// c(또는 두음법칙을 적용한 글자)로 시작하는 단어가 하나라도 있는지. 없으면 그 글자로 끝나는 말은 "한방 단어"
+static bool hasNext(wchar_t c, bool inj) {
+    dict();
+    if (!g_dict) return true;   // 사전 없이 빌드된 경우에는 판정하지 않는다
+    wchar_t d = dueum(c);
+    if (g_first.count(c) || g_first.count(d)) return true;
+    if (inj && extraWords() && (g_firstExtra.count(c) || g_firstExtra.count(d))) return true;
+    return false;
+}
+// c로 시작하고 아직 안 나온 단어 하나 (짧은 것 우선). 없으면 빈 문자열
+static std::wstring exampleFor(wchar_t c, bool inj, bool noKill) {
+    dict();
+    std::vector<const std::wstring*> cand, shortOnes;
+    auto add = [&](std::unordered_map<wchar_t, std::vector<const std::wstring*>>& m, wchar_t ch) {
+        auto it = m.find(ch);
+        if (it == m.end()) return;
+        for (auto* w : it->second) {
+            if (w->size() > 12 || std::find(K.used.begin(), K.used.end(), *w) != K.used.end()) continue;
+            if (noKill && !hasNext(w->back(), inj)) continue;
+            cand.push_back(w);
+            if (w->size() <= 3 && !defOf(*w).empty()) shortOnes.push_back(w);
+        }
+    };
+    add(g_first, c);
+    if (dueum(c) != c) add(g_first, dueum(c));
+    if (inj && extraWords()) {
+        add(g_firstExtra, c);
+        if (dueum(c) != c) add(g_firstExtra, dueum(c));
+    }
+    auto& v = shortOnes.empty() ? cand : shortOnes;
+    if (v.empty()) return L"";
+    return *v[std::uniform_int_distribution<size_t>(0, v.size() - 1)(g_rng)];
 }
 static std::wstring checkWord(const std::wstring& w) {   // 빈 문자열이면 통과
     if (w.size() < 2 || w.size() > 12) return L"2~12글자 단어만 쓸 수 있어요";
@@ -2369,8 +2638,13 @@ static std::wstring checkWord(const std::wstring& w) {   // 빈 문자열이면 
     if (w[0] != lc && w[0] != dueum(lc)) return std::wstring(L"'") + lc + L"'(으)로 시작해야 해요";
     for (auto& u : K.used)
         if (u == w) return L"이미 나온 단어예요";
-    if (const auto* d = dict())
-        if (!d->count(w)) return L"사전에 없는 단어예요";
+    if (const auto* d = dict()) {
+        bool ok = d->count(w) > 0;
+        if (!ok && K.inj && extraWords()) ok = g_extra->count(w) > 0;
+        if (!ok) return K.inj ? L"사전에도 어인정 목록에도 없는 단어예요" : L"사전에 없는 단어예요";
+    }
+    if (K.noKill && !hasNext(w.back(), K.inj))
+        return std::wstring(L"한방 단어는 금지예요 ('") + w.back() + L"'(으)로 시작하는 단어가 없음)";
     return L"";
 }
 
@@ -2387,15 +2661,31 @@ static void kSetTurn(const std::string& cur, int ms) {
     K.turnMs = ms;
     K.deadline = GetTickCount64() + ms;
 }
-static void kApplyStart(const std::wstring& word, const std::string& cur, int ms) {
+static std::wstring kRuleText(bool noKill, bool inj) {
+    return std::wstring(noKill ? L"한방 단어 금지" : L"한방 단어 허용") + (inj ? L" · 어인정 허용" : L" · 사전 단어만");
+}
+static std::wstring cut(const std::wstring& s, size_t n) { return s.size() <= n ? s : s.substr(0, n) + L"…"; }
+// 뜻이 "① … ② … ③ …" 처럼 여러 개면 첫 번째만
+static std::wstring firstDef(const std::wstring& d) {
+    if (d.empty() || d[0] != L'①') return d;
+    size_t e = d.find(L" ②");
+    return d.substr(2, e == std::wstring::npos ? e : e - 2);
+}
+static void kApplyStart(const std::wstring& word, const std::string& cur, int ms, int flags) {
     K.on = true;
     K.last = word;
     K.used = {word};
     K.hist = {{L"시작 단어", word}};
     K.winner.clear();
+    K.noKill = (flags & 1) != 0;
+    K.inj = (flags & 2) != 0;
+    K.def = defOf(word);
+    K.hint.clear();
+    K.wordAt = GetTickCount64();
+    animFor(450);
     K.msg = L"시작 단어는 '" + word + L"'";
     kSetTurn(cur, ms);
-    logLine(L"[끝말잇기] 게임 시작! 첫 단어: " + word);
+    logLine(L"[끝말잇기] 게임 시작! 첫 단어: " + word + L"  (규칙: " + kRuleText(K.noKill, K.inj) + L")");
     kTurnNotice();
 }
 static void kApplyAccept(const std::string& pid, const std::wstring& word, const std::string& next, int ms, int score) {
@@ -2403,8 +2693,12 @@ static void kApplyAccept(const std::string& pid, const std::wstring& word, const
     K.last = word;
     K.used.push_back(word);
     K.hist.push_back({pname(pid), word});
+    K.def = defOf(word);
+    K.hint.clear();
+    K.wordAt = GetTickCount64();
+    animFor(450);
     K.msg = pname(pid) + L"  +" + I((int)word.size() * 10) + L"점";
-    logLine(L"[끝말잇기] " + pname(pid) + L": " + word);
+    logLine(L"[끝말잇기] " + pname(pid) + L": " + word + (K.def.empty() ? L"" : L" — " + cut(firstDef(K.def), 40)));
     kSetTurn(next, ms);
     kTurnNotice();
 }
@@ -2412,10 +2706,19 @@ static void kApplyDeny(const std::string& pid, const std::wstring& word, const s
     K.msg = pname(pid) + L"의 '" + word + L"' 거절 — " + why;
     if (pid == g_pid) gmsg(L"'" + word + L"' 거절: " + why + L" (시간 안에 다시 입력하세요)");
 }
-static void kApplyOut(const std::string& pid, const std::string& next, int ms, const std::wstring& why) {
+// ex: 탈락한 사람이 낼 수 있었던 단어. "-" 이면 낼 수 있는 단어가 없었다는 뜻, 빈칸이면 알려 주지 않음(방을 나간 경우)
+static void kApplyOut(const std::string& pid, const std::string& next, int ms, const std::wstring& why, const std::wstring& ex) {
     if (GPlayer* p = findP(pid)) p->alive = false;
     K.msg = pname(pid) + L" 탈락! (" + why + L")";
     logLine(L"[끝말잇기] " + K.msg);
+    K.hint.clear();
+    if (ex == L"-") {
+        K.hint = std::wstring(L"'") + K.last.back() + L"'(으)로 시작하는 단어가 사전에 없었어요 (한방 단어)";
+    } else if (!ex.empty()) {
+        std::wstring d = firstDef(defOf(ex));
+        K.hint = L"이런 단어가 있었어요: " + ex + (d.empty() ? L"" : L" — " + d);
+    }
+    if (!K.hint.empty()) logLine(L"[끝말잇기] " + cut(K.hint, 70));
     if (!next.empty()) {
         kSetTurn(next, ms);
         kTurnNotice();
@@ -2438,8 +2741,10 @@ static void hostStartK() {
     int n = (int)(sizeof(START_WORDS) / sizeof(START_WORDS[0]));
     std::wstring w = START_WORDS[std::uniform_int_distribution<int>(0, n - 1)(g_rng)];
     grpSendRoster();
-    sendMsg("KSTART", U8(w) + "|" + GP[0].pid + "|15000");
-    kApplyStart(w, GP[0].pid, 15000);
+    if (g_kInj) extraWords();
+    int flags = (g_kNoKill ? 1 : 0) | (g_kInj ? 2 : 0);
+    sendMsg("KSTART", U8(w) + "|" + GP[0].pid + "|15000|" + std::to_string(flags));
+    kApplyStart(w, GP[0].pid, 15000, flags);
 }
 static void hostWord(const std::string& pid, const std::wstring& w) {
     if (!K.on || pid != K.cur) return;
@@ -2456,17 +2761,23 @@ static void hostWord(const std::string& pid, const std::wstring& w) {
     sendMsg("ACCEPT", pid + "|" + U8(w) + "|" + next + "|" + std::to_string(ms) + "|" + std::to_string(score));
     kApplyAccept(pid, w, next, ms, score);
 }
-static void hostOut(const std::string& pid, const std::wstring& why) {
+static void hostOut(const std::string& pid, const std::wstring& why, bool timedOut = false) {
     if (!K.on) return;
     GPlayer* p = findP(pid);
     if (!p || !p->alive) return;
     p->alive = false;
     std::string next = K.cur;
     int ms = (int)std::max<LONGLONG>(1000, (LONGLONG)K.deadline - (LONGLONG)GetTickCount64());
+    std::wstring ex;   // 차례인 사람이 시간 초과로 지면, 낼 수 있었던 단어를 하나 찾아 알려 준다
+    if (pid == K.cur && timedOut && !K.last.empty()) {
+        ex = exampleFor(K.last.back(), K.inj, K.noKill);
+        if (ex.empty()) ex = exampleFor(K.last.back(), K.inj, false);
+        if (ex.empty() && g_dict) ex = L"-";
+    }
     if (pid == K.cur) { next = aliveCount() >= 2 ? nextAlive(pid) : ""; ms = K.turnMs; }
     if (aliveCount() < 2) next = "";
-    sendMsg("OUT", pid + "|" + next + "|" + std::to_string(ms) + "|" + U8(why));
-    kApplyOut(pid, next, ms, why);
+    sendMsg("OUT", pid + "|" + next + "|" + std::to_string(ms) + "|" + U8(why) + "|" + U8(ex));
+    kApplyOut(pid, next, ms, why, ex);
     if (aliveCount() < 2) {
         std::string win;
         for (auto& q : GP)
@@ -2479,7 +2790,7 @@ static void hostOut(const std::string& pid, const std::wstring& why) {
     grpSendRoster();
 }
 static void groupHostTick() {
-    if (g_isHost && K.on && !K.cur.empty() && GetTickCount64() > K.deadline + 300) hostOut(K.cur, L"시간 초과");
+    if (g_isHost && K.on && !K.cur.empty() && GetTickCount64() > K.deadline + 300) hostOut(K.cur, L"시간 초과", true);
 }
 static void groupSys(const std::wstring& s) {   // 방장이 모두에게 알림
     sendMsg("SYS", U8(s));
@@ -2515,7 +2826,9 @@ static struct {
     std::map<std::string, int> picks, last;
     std::vector<std::string> winners;
     bool has = false;
+    ULONGLONG shownAt = 0;   // 결과가 나온 시각 ("가위! 바위! 보!" 하고 흔든 뒤에 손을 편다)
 } GR;
+static const int RPS_SHAKE_MS = 1300;
 static Btn grpsBtn(int i) { return {250 + i * 128, 104, 116, 130}; }
 static void grpsCheck() {
     if (!everyoneIn(GR.picks)) return;
@@ -2533,6 +2846,8 @@ static void grpsCheck() {
             if (GR.picks[p.pid] == w) GR.winners.push_back(p.pid);
     }
     GR.has = true;
+    GR.shownAt = GetTickCount64();
+    animFor(RPS_SHAKE_MS + 500);
     GR.picks.clear();
     std::wstring s;
     for (auto& p : GP) s += (s.empty() ? L"" : L", ") + pname(p.pid) + L" " + RPS_N[GR.last[p.pid]];
@@ -2586,6 +2901,7 @@ static bool gameRealtime() { return M.on && (M.view == V_FIGHT || M.view == V_RA
 static void gameTick(double dt) {
     if (!M.on) return;
     switch (M.view) {
+        case V_YUT: yutTick(); break;
         case V_FIGHT: fightTick(dt); break;
         case V_RACE: raceTick(dt); break;
         case V_FPS: pbTick(dt); break;
@@ -2975,10 +3291,10 @@ static void handleLine(const std::string& line) {
     }
     if (from != g_hostPid) return;   // 아래는 방장만 보낼 수 있는 메시지
     if (type == "SYS") sys(W(payload));
-    else if (type == "KSTART") kApplyStart(W(fs(0)), fs(1), fi(2));
+    else if (type == "KSTART") kApplyStart(W(fs(0)), fs(1), fi(2), fi(3));
     else if (type == "ACCEPT") kApplyAccept(fs(0), W(fs(1)), fs(2), fi(3), fi(4));
     else if (type == "DENY") kApplyDeny(fs(0), W(fs(1)), W(fs(2)));
-    else if (type == "OUT") kApplyOut(fs(0), fs(1), fi(2), W(fs(3)));
+    else if (type == "OUT") kApplyOut(fs(0), fs(1), fi(2), W(fs(3)), W(fs(4)));
     else if (type == "KEND") kApplyEnd(fs(0), fi(1));
     else if (type == "CLOSE" || type == "LEAVE") onDisconnected(L"방장이 방을 닫았습니다.");
 }
@@ -3055,49 +3371,88 @@ static void drawPlayerPanel(HDC dc, int view) {
         y += 44;
     }
 }
+static void kCheck(HDC dc, const Btn& b, bool on, const std::wstring& label, const std::wstring& desc) {
+    roundRect(dc, b.x, b.y + 2, 20, 20, on ? COL_WINC : RGB(255, 255, 255), on ? darker(COL_WINC, 0.85) : COL_LINE, 7, 2);
+    if (on) {
+        line(dc, b.x + 5, b.y + 12, b.x + 9, b.y + 16, RGB(255, 255, 255), 3);
+        line(dc, b.x + 9, b.y + 16, b.x + 15, b.y + 7, RGB(255, 255, 255), 3);
+    }
+    text(dc, b.x + 28, b.y, 120, b.h, label, 15, COL_TEXT, true, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    text(dc, b.x + 140, b.y, b.w - 140, b.h, desc, 12, COL_SUB, false, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+// 탈락한 사람이 낼 수 있었던 단어를 알려 주는 상자
+static void kHintBox(HDC dc, int x, int y, int w, int h) {
+    roundRect(dc, x, y, w, h, RGB(255, 246, 228), COL_ACC, 14, 2);
+    text(dc, x + 10, y + 3, w - 20, h - 6, K.hint, 13, COL_TEXT, false, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS | DT_EDITCONTROL);
+}
 static void drawWord(HDC dc) {
     title(dc, L"끝말잇기", groupSub());
     button(dc, grpCopyBtn, g_relay ? L"코드 복사" : L"IP 복사", true, COL_GRAY, 14);
     drawPlayerPanel(dc, V_WORD);
     int rx = 240, rw = 390;
     if (K.on) {
-        text(dc, rx, 76, rw, 22, L"현재 단어", 14, COL_SUB, true);
-        roundRect(dc, rx, 100, rw, 90, RGB(255, 255, 255), COL_LINE, 18, 2);
-        text(dc, rx, 100, rw, 90, K.last, 42, COL_TEXT, true);
+        text(dc, rx, 76, rw, 22, L"현재 단어", 14, COL_SUB, true, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        text(dc, rx, 76, rw, 22, kRuleText(K.noKill, K.inj), 12, COL_SUB, false, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        roundRect(dc, rx, 100, rw, 104, RGB(255, 255, 255), COL_LINE, 18, 2);
+        double pop = animT(K.wordAt, 400);   // 새 단어가 통 튀어나온다
+        int wsz = (K.def.empty() ? 40 : 34) + (int)std::lround(std::sin(pop * PI) * 10);
+        text(dc, rx, 100, rw, K.def.empty() ? 104 : 52, K.last, wsz, pop < 1 ? COL_ME : COL_TEXT, true);
+        if (!K.def.empty())
+            text(dc, rx + 12, 151, rw - 24, 50, K.def, 12, COL_SUB, false, DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS | DT_EDITCONTROL);
         wchar_t lc = K.last.back(), d = dueum(lc);
         std::wstring need = std::wstring(L"'") + lc + L"'" + (d != lc ? std::wstring(L" 또는 '") + d + L"'" : L"") +
                             L"(으)로 시작하는 단어";
-        text(dc, rx, 196, rw, 26, need, 17, darker(COL_ACC, 0.85), true);
+        text(dc, rx, 208, rw, 24, need, 17, darker(COL_ACC, 0.85), true);
         bool mine = K.cur == g_pid;
-        text(dc, rx, 226, rw, 30, mine ? L"▶ 내 차례! 채팅창에 단어를 입력하세요" : L"▶ " + pname(K.cur) + L" 차례", 18,
+        text(dc, rx, 232, rw, 28, mine ? L"▶ 내 차례! 채팅창에 단어를 입력하세요" : L"▶ " + pname(K.cur) + L" 차례", 18,
              mine ? COL_ME : COL_TEXT, true);
         LONGLONG rem = std::max<LONGLONG>(0, (LONGLONG)K.deadline - (LONGLONG)GetTickCount64());
         int bw = (int)std::min<LONGLONG>(rw - 4, (rw - 4) * rem / std::max(1, K.turnMs));
-        roundRect(dc, rx, 262, rw, 18, RGB(232, 241, 251), COL_LINE, 10, 1);
-        if (bw > 0) fillRect(dc, rx + 2, 264, bw, 14, rem < 4000 ? COL_OP : COL_WINC);
-        text(dc, rx, 282, rw, 20, L"남은 시간 " + I((int)((rem + 999) / 1000)) + L"초", 13, COL_SUB);
-        text(dc, rx, 304, rw, 22, K.msg, 14, COL_TEXT, false, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        text(dc, rx, 332, rw, 20, L"지나온 단어", 13, COL_SUB, true, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        int hy = 354, n = 0;
-        for (int i = (int)K.hist.size() - 1; i >= 0 && n < 5; i--, n++) {
+        roundRect(dc, rx, 264, rw, 18, RGB(232, 241, 251), COL_LINE, 10, 1);
+        if (bw > 0) fillRect(dc, rx + 2, 266, bw, 14, rem < 4000 ? COL_OP : COL_WINC);
+        text(dc, rx, 284, rw, 18, L"남은 시간 " + I((int)((rem + 999) / 1000)) + L"초", 13, COL_SUB);
+        text(dc, rx, 303, rw, 22, K.msg, 14, COL_TEXT, false, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        int hy = 330, rows = 5;
+        if (!K.hint.empty()) {
+            kHintBox(dc, rx, 328, rw, 42);
+            hy = 376;
+            rows = 3;
+        }
+        text(dc, rx, hy, rw, 20, L"지나온 단어", 13, COL_SUB, true, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        hy += 22;
+        int n = 0;
+        for (int i = (int)K.hist.size() - 1; i >= 0 && n < rows; i--, n++) {
             text(dc, rx + 8, hy, rw - 16, 22, K.hist[i].second + L"    · " + K.hist[i].first, 15, n == 0 ? COL_TEXT : COL_SUB,
                  n == 0, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             hy += 23;
         }
     } else {
-        roundRect(dc, rx, 76, rw, 118, RGB(255, 255, 255), COL_LINE, 18, 2);
-        text(dc, rx, 82, rw, 22, g_relay ? L"방 코드 (친구들에게 알려주세요)" : L"방장 IP (같은 와이파이 친구에게 알려주세요)", 14, COL_SUB, true);
-        text(dc, rx, 104, rw, 80, roomLabel(), g_relay ? 50 : 34, COL_ME, true);
-        if (!K.winner.empty()) text(dc, rx, 200, rw, 40, L"우승: " + K.winner, 26, COL_WINC, true);
-        text(dc, rx + 10, 248, rw - 20, 150,
-             L"· 차례가 되면 앞 단어의 끝 글자로 시작하는 단어를 채팅창에 입력\n"
-             L"· 두음법칙 허용 (예: 력 → 역, 라 → 나)\n"
-             L"· 제한 시간 안에 못 내면 탈락, 마지막 1명이 우승 (+50점)\n"
-             L"· 단어 글자 수 × 10점, 이어질수록 제한 시간 감소\n"
-             L"· 표준국어대사전 명사만 인정 (약 19만 개)",
-             14, COL_TEXT, false, DT_LEFT | DT_WORDBREAK);
-        if (g_isHost) button(dc, grpStartBtn, GP.size() >= 2 ? L"게임 시작" : L"2명 이상 필요", GP.size() >= 2, COL_ME, 20);
-        else text(dc, rx, 405, rw, 50, L"방장이 시작하길 기다리는 중...", 17, COL_SUB, true);
+        roundRect(dc, rx, 76, rw, 92, RGB(255, 255, 255), COL_LINE, 18, 2);
+        text(dc, rx, 80, rw, 22, g_relay ? L"방 코드 (친구들에게 알려주세요)" : L"방장 IP (같은 와이파이 친구에게 알려주세요)", 14, COL_SUB, true);
+        text(dc, rx, 100, rw, 64, roomLabel(), g_relay ? 44 : 32, COL_ME, true);
+        int ry = 176;
+        if (!K.winner.empty()) {
+            text(dc, rx, ry, rw, 32, L"우승: " + K.winner, 24, COL_WINC, true);
+            ry += 34;
+        }
+        if (!K.hint.empty()) {   // 마지막 탈락자가 낼 수 있었던 단어
+            kHintBox(dc, rx, ry, rw, 42);
+            ry += 48;
+        }
+        text(dc, rx + 10, ry, rw - 20, 340 - ry,
+             L"· 앞 단어의 끝 글자로 시작하는 단어를 채팅창에 입력\n"
+             L"· 두음법칙 허용, 낸 단어의 뜻이 함께 보임\n"
+             L"· 시간 안에 못 내면 탈락 (낼 수 있었던 단어를 알려 줌)\n"
+             L"· 글자 수 × 10점, 마지막 1명이 우승 (+50점)",
+             13, COL_TEXT, false, DT_LEFT | DT_WORDBREAK);
+        if (g_isHost) {
+            kCheck(dc, kOptKill, g_kNoKill, L"한방 단어 금지", L"이을 말이 없는 단어(예: 나트륨)는 못 냄");
+            kCheck(dc, kOptInj, g_kInj, L"어인정 허용", L"게임 · 만화 · 상표 · 새말도 인정");
+            button(dc, grpStartBtn, GP.size() >= 2 ? L"게임 시작" : L"2명 이상 필요", GP.size() >= 2, COL_ME, 20);
+        } else {
+            text(dc, rx, 352, rw, 40, L"규칙(한방 단어 금지 · 어인정)은 방장이 정합니다", 13, COL_SUB);
+            text(dc, rx, 405, rw, 50, L"방장이 시작하길 기다리는 중...", 17, COL_SUB, true);
+        }
     }
 }
 static void drawGRps(HDC dc) {
@@ -3119,19 +3474,34 @@ static void drawGRps(HDC dc) {
         text(dc, b.x, b.y + 90, b.w, 32, RPS_N[i], 20, COL_TEXT, true);
     }
     if (GR.has) {
+        // 모두 주먹을 "가위! 바위! 보!" 박자에 맞춰 흔들다가 한꺼번에 손을 편다
         bool draw = GR.winners.empty();
+        ULONGLONG el = GetTickCount64() - GR.shownAt;
+        bool shaking = el < (ULONGLONG)RPS_SHAKE_MS;
+        int beat = (int)(el * 3 / RPS_SHAKE_MS);   // 0 가위, 1 바위, 2 보
         text(dc, rx, 248, rw, 22, L"지난 판 결과", 14, COL_SUB, true, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        text(dc, rx, 248, rw, 22, draw ? L"무승부!" : L"이긴 사람 +10점", 14, draw ? COL_ACC : COL_WINC, true,
-             DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-        int y = 274;
+        if (shaking)
+            text(dc, rx, 244, rw, 28, beat == 0 ? L"가위!" : beat == 1 ? L"가위! 바위!" : L"가위! 바위! 보!", 20, COL_ACC, true,
+                 DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        else
+            text(dc, rx, 248, rw, 22, draw ? L"무승부!" : L"이긴 사람 +10점", 14, draw ? COL_ACC : COL_WINC, true,
+                 DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        int cnt = 0;
+        for (auto& p : GP) cnt += (int)GR.last.count(p.pid);
+        int perRow = cnt <= 4 ? std::max(1, cnt) : (cnt + 1) / 2, cw = rw / perRow, k = 0;
+        double pop = animT(GR.shownAt + RPS_SHAKE_MS, 350);
         for (auto& p : GP) {
             if (!GR.last.count(p.pid)) continue;
-            bool win = inList(GR.winners, p.pid);
-            int c = GR.last[p.pid];
-            text(dc, rx + 10, y, 200, 22, pname(p.pid), 15, win ? COL_WINC : COL_TEXT, win, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            text(dc, rx + 210, y, 170, 22, std::wstring(RPS_N[c]) + (win ? L"  승리" : L""), 15, win ? COL_WINC : COL_TEXT, win,
-                 DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            y += 24;
+            bool win = !shaking && inList(GR.winners, p.pid);
+            int cx = rx + (k % perRow) * cw, cy = 276 + (k / perRow) * 84;
+            k++;
+            int bob = shaking ? (int)std::lround(std::fabs(std::sin(el * 3.0 * PI / RPS_SHAKE_MS)) * 16) : 0;
+            int sz = shaking ? 34 : (int)std::lround(34 + std::sin(pop * PI) * 12) + (win ? 4 : 0);
+            if (win) roundRect(dc, cx + 4, cy, cw - 8, 80, RGB(226, 247, 236), COL_WINC, 16, 2);
+            text(dc, cx, cy + 2 - bob, cw, 54, shaking ? RPS_E[1] : RPS_E[GR.last[p.pid]], sz, COL_TEXT, false,
+                 DT_CENTER | DT_VCENTER | DT_SINGLELINE, true);
+            text(dc, cx + 4, cy + 56, cw - 8, 20, pname(p.pid), 13, win ? COL_WINC : COL_TEXT, win,
+                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         }
     }
     if (GP.size() < 2) text(dc, rx, 440, rw, 24, L"2명 이상 있어야 할 수 있어요", 14, COL_OP, true);
@@ -3254,6 +3624,12 @@ static void roomClick(int x, int y) {
                 sys(roomLabel() + L" 를 클립보드에 복사했습니다.");
             } else if (g_isHost && !K.on && grpStartBtn.hit(x, y)) {
                 hostStartK();
+            } else if (g_isHost && !K.on && kOptKill.hit(x, y)) {
+                g_kNoKill = !g_kNoKill;
+                invalidateCanvas();
+            } else if (g_isHost && !K.on && kOptInj.hit(x, y)) {
+                g_kInj = !g_kInj;
+                invalidateCanvas();
             }
             break;
         case V_RPS:
@@ -3649,6 +4025,7 @@ static void onDisconnected(const std::wstring& why) {
     M = Match();
     gameStop();
     K.on = false;
+    K.hint.clear();
     INV.on = false;
     INVIN.on = false;
     g_waitId.clear();
@@ -4145,6 +4522,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     gameTick(dt);
                     roomTick();
                     if (gameRealtime() && g_view == M.view && !g_custom) invalidateCanvas();
+                    else if (GetTickCount64() <= g_animUntil + 40) invalidateCanvas();             // 윷 · 말 · 돌이 움직이는 동안
                     else if (frame % 6 == 0 && (K.on || INV.on || INVIN.on)) invalidateCanvas();   // 남은 시간 막대 등
                 }
             } else if (wp == TIMER_COPY) {   // "복사 완료!" → 원래 글자로

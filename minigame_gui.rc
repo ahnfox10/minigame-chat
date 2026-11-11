@@ -1,2 +1,6 @@
 // 끝말잇기 단어 사전 (표준국어대사전 명사, CC0) 을 exe 안에 넣는다
 1 RCDATA "data\\korean_nouns.txt"
+// 단어 뜻 (표준국어대사전, CC BY-SA 2.0 KR. tools/make_defs.py 로 만든다)
+2 RCDATA "data\\korean_defs.txt"
+// 어인정 단어 (사전에 없지만 다들 아는 말. 방장이 "어인정 허용"을 켰을 때만 쓴다)
+3 RCDATA "data\\extra_words.txt"
